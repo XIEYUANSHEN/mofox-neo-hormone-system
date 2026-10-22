@@ -197,25 +197,27 @@ def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: st
         if not lines and getattr(config.sleep, "inject_journal", True):
             gd = getattr(system, "gen_dream", None)
             if isinstance(gd, dict) and gd.get("worth") and gd.get("recall") != "none":
-                safe = _clean_dream(str(gd.get("text", "")))
-                if safe:
-                    fuzzy = (
-                        "（其实记得很模糊，只能含糊带过、别补细节）"
-                        if gd.get("recall") == "fuzzy" else ""
-                    )
-                    tone = gd.get("tone", "neutral")
-                    if tone == "sweet":
-                        lines.append(
-                            "【梦里还留着甜】：昨晚你梦到他了——" + safe + fuzzy
-                            + "。用你自己的话说、别逐字复述、别每轮都提，气氛合适或他问起时自然讲给他听。"
+                age_h = (time.time() - float(gd.get("ts", 0.0))) / 3600.0
+                if age_h < getattr(config.sleep, "shadow_window_hours", 24.0):
+                    safe = _clean_dream(str(gd.get("text", "")))
+                    if safe:
+                        fuzzy = (
+                            "（其实记得很模糊，只能含糊带过、别补细节）"
+                            if gd.get("recall") == "fuzzy" else ""
                         )
-                    elif tone == "ambivalent":
-                        lines.append(
-                            "【梦里又暖又酸】：昨晚的梦很暖却有点抓不住——" + safe + fuzzy
-                            + "。他问起或你忍不住时可以自然流露。"
-                        )
-                    else:
-                        lines.append("【昨晚好像做了个梦】：" + safe + "，提不提都行。")
+                        tone = gd.get("tone", "neutral")
+                        if tone == "sweet":
+                            lines.append(
+                                "【梦里还留着甜】：昨晚你梦到他了——" + safe + fuzzy
+                                + "。用你自己的话说、别逐字复述、别每轮都提，气氛合适或他问起时自然讲给他听。"
+                            )
+                        elif tone == "ambivalent":
+                            lines.append(
+                                "【梦里又暖又酸】：昨晚的梦很暖却有点抓不住——" + safe + fuzzy
+                                + "。他问起或你忍不住时可以自然流露。"
+                            )
+                        else:
+                            lines.append("【昨晚好像做了个梦】：" + safe + "，提不提都行。")
 
         tone_line = _SLEEP_TONE.get(phase, "")
         if tone_line:

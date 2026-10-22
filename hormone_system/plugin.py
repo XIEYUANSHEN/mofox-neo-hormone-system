@@ -263,8 +263,8 @@ class HormonePromptHandler(BaseEventHandler):
 
         return content
 
-    async def _score_with_llm(self, text: str, config: HormoneSystemConfig) -> float | None:
-        """用 LLM 给用户消息打情绪分；失败/超时返回 None（调用方回退词典）。"""
+    async def _score_with_llm(self, text: str, config: HormoneSystemConfig) -> dict[str, Any] | None:
+        """用 LLM 给用户消息打情绪分；返回情绪通道 dict，失败/超时返回 None（调用方回退词典）。"""
         if not config.score.enabled:
             return None
         try:
@@ -345,8 +345,8 @@ class HormonePromptHandler(BaseEventHandler):
 
             store = self._get_store(config)
             system = HormoneSystem(config)
-            # 与夜间整理调度任务串行化：整段 读态→结算→存态 持同一把 stream 锁
-            async with _lock_for(stream_id):
+            # 与夜间整理调度任务串行化：锁 key 用落盘路径，两侧对同一文件一致
+            async with _lock_for(store.state_path(stream_id)):
                 data = store.load(stream_id)
                 if data:
                     system.apply_state(data)
@@ -507,7 +507,7 @@ class HormoneSystemPlugin(BasePlugin):
                 return
 
     async def _consolidate_job(self) -> None:
-        """周期任务：遍历各 stream，落在临醒窗口且本窗口未生成过则生成当晚的梦。"""
+        """周期任务：临醒窗口内为各 stream 生成当晚的梦；模型调用在锁外，避免阻塞回复。"""
         cfg = getattr(self, "config", None)
         if not isinstance(cfg, HormoneSystemConfig) or not cfg.sleep.consolidate:
             return
@@ -520,26 +520,40 @@ class HormoneSystemPlugin(BasePlugin):
                 continue
             sid = fn[:-5]
             try:
-                async with _lock_for(sid):
+                key = store.state_path(sid)
+                # 临界区1（短，不含网络）：读态 + 判窗口 + 去重 + 取原料
+                async with _lock_for(key):
                     data = store.load(sid)
                     if not data:
                         continue
-                    system = HormoneSystem(cfg)
-                    system.apply_state(data)
-                    if not _in_pre_wake_window(system, now, cfg):
+                    probe = HormoneSystem(cfg)
+                    probe.apply_state(data)
+                    if not _in_pre_wake_window(probe, now, cfg):
                         continue
-                    window_start = system._day_anchor(
+                    window_start = probe._day_anchor(
                         now, max(cfg.sleep.wake_time - cfg.sleep.dream_pre_wake_hours, 0.0)
                     )
-                    gd = system.gen_dream
+                    gd = probe.gen_dream
                     if isinstance(gd, dict) and float(gd.get("ts", 0.0)) >= window_start:
                         continue  # 本窗口已生成过
-                    items, tone = system.get_generation_input()
+                    items, tone = probe.get_generation_input()
                     if not items or tone in (None, "nightmare"):
                         continue  # 噩梦交回既有阴影路径；无原料不生成
-                    gen = await _generate_dream(cfg, items, tone)
-                    if not gen:
-                        continue
+
+                # 锁外调模型（可能耗时）→ 不占用 stream 锁、不阻塞回复
+                gen = await _generate_dream(cfg, items, tone)
+                if not gen:
+                    continue
+
+                # 临界区2（短）：重载最新态 → 二次去重 → 应用 → 存
+                async with _lock_for(key):
+                    fresh = store.load(sid) or {}
+                    system = HormoneSystem(cfg)
+                    if fresh:
+                        system.apply_state(fresh)
+                    gd2 = system.gen_dream
+                    if isinstance(gd2, dict) and float(gd2.get("ts", 0.0)) >= window_start:
+                        continue  # 等模型这段时间里可能已生成过
                     system.apply_generated_dream(gen["dream"], tone, gen["recall"], gen["worth"])
                     store.save(sid, system.to_state(cfg.core.state_version))
                     logger.info(
