@@ -97,6 +97,32 @@ SLEEP_DREAM_LINES = (
     "迷迷糊糊总听到手机在响，爬起来看却又什么都没有。",
 )
 
+# ========== 睡眠记忆整理 / 梦生成参数（§4.5 拍板） ==========
+# 基调判定：R=睡前净效价，W=依恋水平
+DREAM_R_NIGHTMARE = -0.15      # R ≤ 此值 → 偏负（噩梦倾向，交给 v0.2.0 阴影路径）
+DREAM_R_SWEET = 0.15           # R ≥ 此值 → 偏正（美梦倾向）
+DREAM_W_OXYTOCIN = 70.0        # 催产素达此视为「够在意」→ 值得梦到你
+DREAM_W_CORSTRESS = 45.0       # 混合基调所需的「残存焦虑」皮质醇下限
+DREAM_AMBIVALENT_PROB = 0.15   # 满足条件时，混合梦低频冒出的概率
+# 显著性分档（|情绪分| 主导）：喂给模型时决定详略
+SALIENCE_HIGH = 0.5
+SALIENCE_MID = 0.25
+# 模型不可用时的兜底模板（成年亲密内容允许；无数字、无激素名）
+SLEEP_SWEET_DREAM_LINES = (
+    "梦到你们并肩走在很安静的地方，说了好多平时没说出口的话。",
+    "梦到他把你拥得很紧，暖得不想醒。",
+    "梦到你们一起做饭、逛了很长的夜路，醒来嘴角还是翘的。",
+    "梦到很多年后你们还在一起，画面很平常，却特别安心。",
+)
+SLEEP_NEUTRAL_DREAM_LINES = (
+    "好像做了个梦，醒了记不太清，只剩点温吞的影子。",
+    "梦里都是些零碎的日常，说不上开心也说不上难过。",
+)
+SLEEP_AMBIVALENT_DREAM_LINES = (
+    "梦到他抱着你，很暖，可你一直怕一睁眼就没了。",
+    "梦到你们去了很远的地方，很开心，却怎么都到不了终点。",
+)
+
 
 class HormoneSystem:
     """单个 stream 的情绪状态机（基线 50，各激素按半衰期向基线回归）。"""
@@ -133,6 +159,10 @@ class HormoneSystem:
         self.sleep_score: int = 100
         self.sleep_thoughts: str = ""
         self.last_sleep_time: float = 0.0
+        # 睡眠记忆整理 / 梦生成状态
+        self.recent_turns: list[dict] = []        # 仅 consolidate=true 时缓冲的原料
+        self.sleep_journal: list[dict] = []       # 小本本（有界环形）
+        self.gen_dream: dict | None = None        # 生成的非噩梦 {text,tone,recall,worth,ts}
         self.scorer = SentimentScorer()
 
     # ---------- 基础工具 ----------
@@ -288,6 +318,10 @@ class HormoneSystem:
         self.emotion_memory.append((score, time.time()))
         if len(self.emotion_memory) > self._cfg.core.memory_window:
             self.emotion_memory.pop(0)
+
+        # 睡眠整理原料：仅在 consolidate 开启时缓冲本轮用户消息（截断控 token）
+        if self._cfg.sleep.consolidate and text:
+            self._push_recent_turn(text, score)
 
         smoothed_aff = self._compute_smoothed_aff()
 
@@ -814,6 +848,86 @@ class HormoneSystem:
             return "wind_down"
         return ""
 
+    # ---------- 睡眠记忆整理 / 梦生成辅助 ----------
+    def _push_recent_turn(self, text: str, score: float) -> None:
+        """把本轮用户消息截断后压入 recent_turns（仅 consolidate 开启时被调用）。"""
+        clip = text if len(text) <= 80 else text[:80]
+        self.recent_turns.append(
+            {
+                "text": clip,
+                "score": float(self._clamp(score, -1.0, 1.0, 0.0)),
+                "ts": time.time(),
+            }
+        )
+        cap = self._cfg.sleep.turn_buffer_max
+        if len(self.recent_turns) > cap:
+            self.recent_turns.pop(0)
+
+    def _turn_salience(self, item: dict) -> float:
+        """单条原料的显著性：|情绪分| 为主，依恋/共情高位时加一点权重。"""
+        base = abs(float(item.get("score", 0.0)))
+        bonus = 0.0
+        if self.hormones.get("oxytocin", 50.0) > 70:
+            bonus += 0.15
+        if self.hormones.get("empathy", 50.0) > 70:
+            bonus += 0.10
+        return base + bonus
+
+    def get_generation_input(self) -> tuple[list[dict], str | None]:
+        """取整理原料 Top-K 与梦基调 hint，供插件层调模型生成。
+
+        返回 (topk_items, tone)，tone ∈ {'sweet','neutral','ambivalent','nightmare'} 或 None。
+        'nightmare' 交回既有 v0.2.0 阴影路径，本函数不生成噩梦内容。
+        """
+        cfg = self._cfg.sleep
+        if not cfg.consolidate or not self.recent_turns:
+            return [], None
+        ranked = sorted(self.recent_turns, key=self._turn_salience, reverse=True)
+        topk = ranked[: cfg.top_k]
+        R = self._compute_smoothed_aff()
+        oxy = self.hormones.get("oxytocin", 50.0)
+        cor = self.hormones.get("cortisol", 50.0)
+        if R <= DREAM_R_NIGHTMARE:
+            return topk, "nightmare"
+        if R >= DREAM_R_SWEET or oxy >= DREAM_W_OXYTOCIN:
+            if (
+                oxy >= DREAM_W_OXYTOCIN
+                and cor >= DREAM_W_CORSTRESS
+                and random.random() < DREAM_AMBIVALENT_PROB
+            ):
+                return topk, "ambivalent"
+            return topk, "sweet"
+        return topk, "neutral"
+
+    def apply_generated_dream(
+        self, dream_text: str, tone: str, recall: str, worth: bool
+    ) -> None:
+        """写回模型生成的梦；worth 为真才进小本本；随后清空原料缓冲。"""
+        now = time.time()
+        self.gen_dream = {
+            "text": dream_text,
+            "tone": tone,
+            "recall": recall,
+            "worth": bool(worth),
+            "ts": now,
+        }
+        if worth and dream_text:
+            import datetime as _dt
+            self.sleep_journal.append(
+                {
+                    "date": _dt.date.fromtimestamp(now).isoformat(),
+                    "text": dream_text,
+                    "tone": tone,
+                    "recall": recall,
+                    "salience": round(self._compute_smoothed_aff(), 3),
+                    "quality": self.sleep_quality,
+                }
+            )
+            limit = self._cfg.sleep.journal_max_days
+            if len(self.sleep_journal) > limit:
+                self.sleep_journal = self.sleep_journal[-limit:]
+        self.recent_turns = []
+
     def _extract_topic_tokens(self, text: str) -> set[str]:
         """从文本提取话题词元（中文短词 + 字符 bigram）。"""
         if not text:
@@ -908,6 +1022,9 @@ class HormoneSystem:
             "sleep_score": int(self.sleep_score),
             "sleep_thoughts": str(self.sleep_thoughts),
             "last_sleep_time": float(self.last_sleep_time),
+            "recent_turns": [dict(t) for t in self.recent_turns],
+            "sleep_journal": [dict(j) for j in self.sleep_journal],
+            "gen_dream": dict(self.gen_dream) if self.gen_dream else None,
             "version": version,
         }
 
@@ -996,3 +1113,26 @@ class HormoneSystem:
         ts = data.get("last_sleep_time")
         if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts >= 0:
             self.last_sleep_time = float(ts)
+
+        raw_rt = data.get("recent_turns", [])
+        if isinstance(raw_rt, list):
+            turns: list[dict] = []
+            for item in raw_rt:
+                if isinstance(item, dict) and "text" in item:
+                    turns.append(
+                        {
+                            "text": str(item.get("text", "")),
+                            "score": self._clamp(item.get("score", 0.0), -1.0, 1.0, 0.0),
+                            "ts": float(item.get("ts", time.time())),
+                        }
+                    )
+            self.recent_turns = turns[-self._cfg.sleep.turn_buffer_max:]
+
+        raw_jn = data.get("sleep_journal", [])
+        if isinstance(raw_jn, list):
+            journal: list[dict] = [j for j in raw_jn if isinstance(j, dict) and "text" in j]
+            self.sleep_journal = journal[-self._cfg.sleep.journal_max_days:]
+
+        raw_gd = data.get("gen_dream")
+        if isinstance(raw_gd, dict) and "text" in raw_gd:
+            self.gen_dream = raw_gd

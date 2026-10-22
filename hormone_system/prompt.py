@@ -149,17 +149,32 @@ _SLEEP_TONE = {
 }
 
 
+def _clean_dream(text: str) -> str:
+    """梦文本护栏：含阿拉伯数字或激素名一律判废（返回空串），守无数字/无激素名铁律。"""
+    if not text:
+        return ""
+    if any(ch.isdigit() for ch in text):
+        return ""
+    for w in ("多巴胺", "皮质醇", "催产素", "血清素", "内啡肽", "共情"):
+        if w in text:
+            return ""
+    return text.strip()
+
+
 def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: str) -> list[str]:
-    """睡眠相关的注入行：起床气 / 潜意识阴影 / 相位语气（全为定性描述）。"""
+    """睡眠相关注入行：起床气 / 潜意识阴影(噩梦,对齐v0.2.0) / 生成的美梦·中性·混合 / 相位语气。"""
     lines: list[str] = []
     try:
         if not getattr(config.sleep, "enabled", False):
             return lines
+
         turns = getattr(system, "wake_up_turns", 0)
         reason = getattr(system, "wake_up_reason", "")
         if turns > 0 and reason:
+            # 起床缓冲期优先，压住一切梦境
             lines.append("【起床状态】：" + reason)
         else:
+            # 噩梦：完全保持 v0.2.0 行为（激素门控的潜意识阴影，不主动讲、只在类似情节回想）
             quality = getattr(system, "sleep_quality", "")
             thought = getattr(system, "sleep_thoughts", "")
             last_sleep = getattr(system, "last_sleep_time", 0.0)
@@ -177,9 +192,34 @@ def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: st
                     + thought
                     + "）；不用主动提起，但气氛安静或对方让你不安时，可以自然流露出一点害怕或想被陪。"
                 )
-        tone = _SLEEP_TONE.get(phase, "")
-        if tone:
-            lines.append(tone)
+
+        # 非噩梦的生成梦（美梦 / 中性 / 混合）：仅当上面没有任何梦境行、且允许注入时，最多补一条
+        if not lines and getattr(config.sleep, "inject_journal", True):
+            gd = getattr(system, "gen_dream", None)
+            if isinstance(gd, dict) and gd.get("worth") and gd.get("recall") != "none":
+                safe = _clean_dream(str(gd.get("text", "")))
+                if safe:
+                    fuzzy = (
+                        "（其实记得很模糊，只能含糊带过、别补细节）"
+                        if gd.get("recall") == "fuzzy" else ""
+                    )
+                    tone = gd.get("tone", "neutral")
+                    if tone == "sweet":
+                        lines.append(
+                            "【梦里还留着甜】：昨晚你梦到他了——" + safe + fuzzy
+                            + "。用你自己的话说、别逐字复述、别每轮都提，气氛合适或他问起时自然讲给他听。"
+                        )
+                    elif tone == "ambivalent":
+                        lines.append(
+                            "【梦里又暖又酸】：昨晚的梦很暖却有点抓不住——" + safe + fuzzy
+                            + "。他问起或你忍不住时可以自然流露。"
+                        )
+                    else:
+                        lines.append("【昨晚好像做了个梦】：" + safe + "，提不提都行。")
+
+        tone_line = _SLEEP_TONE.get(phase, "")
+        if tone_line:
+            lines.append(tone_line)
     except Exception:
         return lines
     return lines

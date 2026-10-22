@@ -77,7 +77,7 @@ class HormoneSystemConfig(BaseConfig):
             description="消息历史上限（预留参数，第一版未使用）",
         )
         state_version: int = Field(
-            default=1,
+            default=2,
             description="状态文件版本号",
         )
 
@@ -149,6 +149,54 @@ class HormoneSystemConfig(BaseConfig):
             ge=0.0,
             le=72.0,
             description="睡坏后多少小时内、且压力高/情绪低时，梦境会以「潜意识的阴影」渗进心境",
+        )
+        consolidate: bool = Field(
+            default=True,
+            description="睡眠记忆整理/梦生成总开关（默认开；关=只数值衰减，不注册调度、不写小本本、不调模型）",
+        )
+        consolidate_model_task: str = Field(
+            default="",
+            description="整理/生成用的模型任务名（对应 model.toml 的 [model_tasks.xxx]）；留空 = 跟随主回复模型(actor)",
+        )
+        dream_pre_wake_hours: float = Field(
+            default=1.0,
+            ge=0.0,
+            le=4.0,
+            description="临醒前多久由定时任务生成当晚的梦",
+        )
+        dream_check_minutes: int = Field(
+            default=15,
+            ge=5,
+            le=60,
+            description="定时任务检查间隔（分钟）；落在临醒窗口才真正生成",
+        )
+        journal_max_days: int = Field(
+            default=3,
+            ge=1,
+            le=14,
+            description="小本本保留天数（环形）",
+        )
+        top_k: int = Field(
+            default=5,
+            ge=1,
+            le=10,
+            description="每晚送模型整理的显著条目上限",
+        )
+        turn_buffer_max: int = Field(
+            default=40,
+            ge=5,
+            le=100,
+            description="recent_turns 原料缓冲上限",
+        )
+        consolidate_timeout_seconds: float = Field(
+            default=15.0,
+            ge=1.0,
+            le=60.0,
+            description="整理/生成调用超时（秒），超时跳过今晚",
+        )
+        inject_journal: bool = Field(
+            default=True,
+            description="是否把生成的梦/「心里记着的事」渗进心境 prompt",
         )
 
     @config_section("topic")

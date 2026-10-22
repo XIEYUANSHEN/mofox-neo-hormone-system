@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 data/
 *.mfp
+dist/
+ref_kfc_memory_bridge/
