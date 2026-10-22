@@ -1,0 +1,43 @@
+{
+  "name": "hormone_system",
+  "display_name": "赛博内分泌",
+  "version": "0.2.0",
+  "description": "为 KFC 角色提供情绪惯性与疲劳度",
+  "author": "",
+  "license": "MIT",
+  "categories": [
+    "chat"
+  ],
+  "tags": [
+    "hormone",
+    "emotion",
+    "kfc"
+  ],
+  "dependencies": {
+    "plugins": [
+      "kokoro_flow_chatter"
+    ],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "event_handler",
+      "component_name": "hormone_prompt_handler",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "config",
+      "component_name": "config",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.3.0-alpha.0",
+  "api_version": {
+    "stream_api": "2.0.0"
+  },
+  "python_dependencies": [],
+  "dependencies_required": true
+}
