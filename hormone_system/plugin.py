@@ -139,6 +139,24 @@ _DREAM_PROMPT = (
 )
 
 
+def _coerce_dream(parsed: dict | None) -> dict | None:
+    """把模型输出规整为 {dream, recall, worth}；非 dict 或 dream 空 → None。
+
+    recall 归一到 clear/fuzzy/none；worth 兼容字符串("false"等)与布尔。
+    """
+    if not isinstance(parsed, dict) or not parsed.get("dream"):
+        return None
+    recall = str(parsed.get("recall", "fuzzy"))
+    if recall not in ("clear", "fuzzy", "none"):
+        recall = "fuzzy"
+    raw_worth = parsed.get("worth", False)
+    if isinstance(raw_worth, str):
+        worth = raw_worth.strip().lower() in ("true", "1", "yes", "是")
+    else:
+        worth = bool(raw_worth)
+    return {"dream": str(parsed.get("dream", ""))[:160], "recall": recall, "worth": worth}
+
+
 async def _generate_dream(
     config: HormoneSystemConfig, items: list[dict], tone: str
 ) -> dict | None:
@@ -173,17 +191,10 @@ async def _generate_dream(
         )
         raw = (await result or "").strip()
         parsed = _parse_emotions(raw)  # 复用宽松 JSON 提取
-        if not isinstance(parsed, dict) or not parsed.get("dream"):
+        out = _coerce_dream(parsed)
+        if out is None:
             logger.debug(f"梦生成无法解析: {raw[:60]!r}")
-            return None
-        recall = str(parsed.get("recall", "fuzzy"))
-        if recall not in ("clear", "fuzzy", "none"):
-            recall = "fuzzy"
-        return {
-            "dream": str(parsed.get("dream", ""))[:160],
-            "recall": recall,
-            "worth": bool(parsed.get("worth", False)),
-        }
+        return out
     except Exception as exc:  # noqa: BLE001 - 生成失败不能影响任何链路
         logger.debug(f"梦生成失败，跳过今晚: {exc}")
         return None
