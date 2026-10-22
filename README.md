@@ -66,4 +66,6 @@ shadow_window_hours = 24.0  # 潜意识阴影可残留多久（小时）
 
 ## 许可
 
-MIT
+本项目以 **GNU Affero General Public License v3.0（AGPL-3.0）** 授权，全文见仓库 `LICENSE`。
+
+选用 AGPL 是有意为之：衍生版本（含通过网络提供服务的方式）必须以同样的许可开源，并保留对本项目及「睡眠 ↔ 激素联动」想法来源（风尘笙箫）的署名。

@@ -4,7 +4,7 @@
   "version": "0.2.0",
   "description": "为 KFC 角色提供情绪惯性与疲劳度",
   "author": "",
-  "license": "MIT",
+  "license": "AGPL-3.0",
   "categories": [
     "chat"
   ],
