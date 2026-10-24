@@ -98,6 +98,45 @@ def _clip_text(text: str, limit: int) -> str:
     return text[:half] + chr(10) + "…" + chr(10) + text[-half:]
 
 
+# KFC 转发信封：`[新消息]\n》2026-10-24 13:52:46》[QQ:2750694203] 中生 [消息id:532868125]：`
+# 只留「昵称：正文」——QQ 号/时间/消息 id 对情绪打分和入梦原料都是噪声，
+# 但昵称必须留：梦是第一人称写的，模型手里没有别的线索能知道"这些事是跟谁发生的"。
+_RELAY_ENVELOPE = re.compile(
+    r"(?:\[新消息\]\s*)?(?:》[^》]{0,60}》\s*)*(?:\[QQ:\s*\d+\]\s*)?"
+    r"(?P<name>[^\[\]\n：:]{0,40}?)\s*\[消息id[:：]\s*\d+\]\s*[：:]?\s*",
+    re.S,
+)
+# 引用回复的嵌套壳：`[回复<昵称(id)：被引的原话]，说：真正说出口的话`
+# 末尾那个 `[回复<…` 不留 `]` 的，是被上游截断的半截壳，一并清掉。
+_REPLY_PREFIX = re.compile(
+    r"^\s*(?:\[回复<[^\]\n]{0,160}\](?:\s*[，,]\s*说\s*[：:])?\s*|\[回复<[^\n]*$)\s*"
+)
+_SPEAKER_MAX = 12
+
+
+def _normalize_relay_text(text: str) -> str:
+    """把 KFC 转发信封压成「昵称：正文」；普通消息原样返回。
+
+    - 只认 `[消息id:…]` 这个信封标记，不会误伤正常聊天里的冒号；
+    - 昵称保留、过长截到 12 字；引用壳剥掉，只留真正说出口的那句；
+    - 剥完没有正文（只有壳/只有引用）时返回空串，由调用方跳过这条原料，
+      绝不把纯壳当正文喂给模型。
+    """
+    src = text or ""
+    matches = list(_RELAY_ENVELOPE.finditer(src))
+    if not matches:
+        return src
+    last = matches[-1]
+    body = _REPLY_PREFIX.sub("", src[last.end():])
+    body = " ".join(body.split())
+    name = " ".join((last.group("name") or "").split())
+    if len(name) > _SPEAKER_MAX:
+        name = name[:_SPEAKER_MAX]
+    if not body:
+        return ""
+    return f"{name}：{body}" if name else body
+
+
 def _parse_emotions(raw: str) -> dict[str, float] | None:
     """从模型输出里提取 JSON 对象；失败返回 None（调用方回退词典）。"""
     text = (raw or "").strip()
@@ -134,8 +173,7 @@ _DREAM_PROMPT = (
     "不出现任何数字和激素名称。\n"
     "基调（tone）会告诉你梦偏甜(sweet)/偏中性(neutral)/甜虐交织(ambivalent)；"
     "下面附上她白天情绪波动最大的几件事作为素材，梦可以从里面延伸、变形，但不必逐条复述。\n"
-    "同时自评两样：recall=梦醒来还记得多清楚（clear/fuzzy/none）；worth=值不值得记进'小本本'（true/false）。\n"
-    '只输出 JSON，不要解释、不要 markdown。例：{"dream":"…","recall":"fuzzy","worth":true}'
+    '只输出 JSON，不要解释、不要 markdown。例：{"dream":"…"}'
 )
 
 
@@ -157,60 +195,245 @@ def _coerce_dream(parsed: dict | None) -> dict | None:
     return {"dream": str(parsed.get("dream", ""))[:160], "recall": recall, "worth": worth}
 
 
-async def _generate_dream(
-    config: HormoneSystemConfig, items: list[dict], tone: str
-) -> dict | None:
-    """用 consolidate_model_task（留空则跟随主回复 actor）生成一段梦；
-    任务与 actor 都不可用 / 超时 / 不可解析 → 返回 None（跳过今晚，绝不影响回复）。
+# 整理类调用（做梦/定作息/补觉）的模型任务候选链：首选没成就往后退。
+# 为什么要有链：这些调用默认跟随主回复模型（actor），主模型欠费/挂掉时，
+# 熬夜里的梦、作息、补觉会一起静默消失——它们并不是非 actor 不可。
+_CONSOLIDATE_TASK_CHAIN = ("actor", "sub_actor", "utils_small", "utils")
+
+
+def _consolidate_tasks(config: HormoneSystemConfig) -> tuple[str, ...]:
+    """整理调用依次尝试的模型任务名：配置的任务优先，再走内置兜底链（去重）。"""
+    named = (config.sleep.consolidate_model_task or "").strip()
+    chain: list[str] = []
+    for task in ([named] if named else []) + list(_CONSOLIDATE_TASK_CHAIN):
+        if task and task not in chain:
+            chain.append(task)
+    return tuple(chain)
+
+
+def _reason(text: Any, limit: int = 90) -> str:
+    """把异常/回包压成一行能给人看的原话（空异常也要有字）。"""
+    s = " ".join(str(text).split())
+    if not s:
+        return "无详细信息"
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+async def _call_consolidate_llm(
+    config: HormoneSystemConfig,
+    system_text: str,
+    user_text: str,
+    request_name: str,
+    report: dict | None = None,
+) -> str | None:
+    """按候选任务链向模型要一段文本；全都没成就返回 None，并把原因写进 report["error"]。
+
+    - 单个任务最多等 consolidate_timeout_seconds，等不到就换下一个备用任务；
+    - 整条链共享 consolidate_total_seconds 总预算，绝不让后台整理拖成长任务；
+    - 只有前面的任务失败（任务不存在/接口报错/超时/空回复）才会试下一个；
+    - 任何情况下都不抛异常出去，后台整理不能影响正常回复。
     """
-    task_name = (config.sleep.consolidate_model_task or "").strip() or "actor"
     try:
         from src.app.plugin_system.api.llm_api import (
             create_llm_request,
             get_model_set_by_task,
         )
         from src.app.plugin_system.types import LLMPayload, ROLE, Text
-
-        try:
-            model_set = get_model_set_by_task(task_name)
-        except Exception:
-            if task_name == "actor":
-                raise
-            logger.warning(f"整理模型任务 '{task_name}' 不可用，回退 actor")
-            model_set = get_model_set_by_task("actor")
-        material = "\n".join(
-            f"- {it.get('text', '')}" for it in items if it.get("text")
-        )
-        user_text = f"基调：{tone}\n白天她在意的事：\n{material}"
-        request = create_llm_request(model_set, "hormone_dream")
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_DREAM_PROMPT)))
-        request.add_payload(LLMPayload(ROLE.USER, Text(user_text)))
-        result = await asyncio.wait_for(
-            request.send(stream=False),
-            timeout=config.sleep.consolidate_timeout_seconds,
-        )
-        raw = (await result or "").strip()
-        parsed = _parse_emotions(raw)  # 复用宽松 JSON 提取
-        out = _coerce_dream(parsed)
-        if out is None:
-            logger.debug(f"梦生成无法解析: {raw[:60]!r}")
-        return out
-    except Exception as exc:  # noqa: BLE001 - 生成失败不能影响任何链路
-        logger.debug(f"梦生成失败，跳过今晚: {exc}")
+    except Exception as exc:  # noqa: BLE001 - 脱离框架跑离线测试时属正常
+        if report is not None:
+            report["error"] = f"框架 LLM 接口不可用（{type(exc).__name__}）"
         return None
 
+    chain = _consolidate_tasks(config)
+    per = max(1.0, float(config.sleep.consolidate_timeout_seconds))
+    total = max(per, float(getattr(config.sleep, "consolidate_total_seconds", per)))
+    end = time.monotonic() + total
+    reasons: list[str] = []
+    for idx, task in enumerate(chain):
+        left = end - time.monotonic()
+        if left < 1.0:
+            reasons.append(f"{task}: 总时间预算用完")
+            break
+        try:
+            model_set = get_model_set_by_task(task)
+            request = create_llm_request(model_set, request_name)
+            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_text)))
+            request.add_payload(LLMPayload(ROLE.USER, Text(user_text)))
+            result = await asyncio.wait_for(
+                request.send(stream=False), timeout=min(per, left)
+            )
+            raw = ((await result) or "").strip()
+        except Exception as exc:  # noqa: BLE001 - 这个任务不成，换下一个
+            reasons.append(f"{task}: {type(exc).__name__} {_reason(exc)}".strip())
+            continue
+        if not raw:
+            reasons.append(f"{task}: 空回复")
+            continue
+        if idx > 0:
+            logger.info(
+                f"[Model] {request_name} 换用备用模型任务 {task}"
+                f"（前面 {'/'.join(chain[:idx])} 没成）"
+            )
+        return raw
+    err = "；".join(reasons) or "无可用模型任务"
+    if report is not None:
+        report["error"] = err
+    logger.debug(f"[Model] {request_name} 各任务都没成: {_reason(err, 200)}")
+    return None
 
-def _in_pre_wake_window(system: HormoneSystem, now: float, config: HormoneSystemConfig) -> bool:
-    """now 是否落在临醒窗口 [wake_time - dream_pre_wake_hours, wake_time)。"""
-    cfg = config.sleep
-    if not cfg.consolidate or not cfg.wake_time:
-        return False
+
+async def _generate_dream(
+    config: HormoneSystemConfig,
+    items: list[dict],
+    tone: str,
+    report: dict | None = None,
+) -> dict | None:
+    """用模型生成一段梦（只要内容；清不清楚、值不值得记留给醒来那一刀判定）。
+
+    任务链全挂 / 超时 / 不可解析 → 返回 None（今晚跳过，绝不影响回复），
+    失败原因塞进 report["error"]，由调用方决定怎么说、说几次。
+    """
+    material = "\n".join(
+        f"- {it.get('text', '')}" for it in items if it.get("text")
+    )
+    user_text = f"基调：{tone}\n白天她在意的事：\n{material}"
+    raw = await _call_consolidate_llm(
+        config, _DREAM_PROMPT, user_text, "hormone_dream", report=report
+    )
+    if raw is None:
+        return None
+    out = _coerce_dream(_parse_emotions(raw))
+    if out is None:
+        logger.debug(f"梦生成无法解析: {raw[:60]!r}")
+        if report is not None:
+            report["error"] = f"模型回的不是梦：{_reason(raw, 60)}"
+    return out
+
+
+_PLAN_PROMPT = (
+    "你在替'她'决定今晚几点睡、睡多久。参考现在的时刻，以及她今天有多累、心情如何。\n"
+    "推荐睡约 6 小时：睡少会影响明天状态（更累、易烦）；睡多可以补觉，但睡过头会睡懵。\n"
+    "如果此刻还在和对方聊，可以定晚一点、甚至先不定。\n"
+    "就寝落在 20:00–次日06:00 之间、时长 1–12 小时（这是防呆范围，不是硬性要求）。\n"
+    '只输出 JSON，不要解释、不要 markdown。例：{"bedtime":"23:40","duration_h":6.5,"note":"今天有点累"}'
+)
+
+
+def _hour_from(value: Any) -> float | None:
+    """把 "23:40" 或数字解析成小时（float）；失败返回 None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.match(r"^\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*$", value)
+        if m:
+            return int(m.group(1)) + int(m.group(2)) / 60.0
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _fallback_plan(system: HormoneSystem) -> dict:
+    """模型不可用时的确定性兜底：越累越早睡、睡越久。"""
+    now = time.time()
     hour = system._hours_since_midnight(now)
-    start = cfg.wake_time - cfg.dream_pre_wake_hours
-    end = cfg.wake_time
-    if start < 0.0:
-        return hour >= start + 24.0 or hour < end
-    return start <= hour < end
+    fatigue = system.fatigue
+    base = 23.0 - max(0.0, fatigue - 50.0) / 50.0 * 1.5
+    dur = 6.0 + max(0.0, fatigue - 30.0) / 70.0 * 1.5
+    # 若此刻已经很晚，就寝顺延到当前之后
+    if hour > base:
+        base = min(hour + 0.5, 23.9)
+    return {"bedtime": base, "duration_h": dur, "note": "fallback", "source": "fallback"}
+
+
+async def _generate_sleep_plan(
+    config: HormoneSystemConfig, system: HormoneSystem, report: dict | None = None
+) -> dict:
+    """用模型定今晚作息；失败/超时/不可解析 → 兜底公式（绝不影响回复）。"""
+    now = time.time()
+    hour = system._hours_since_midnight(now)
+    user_text = (
+        f"现在 {hour:.2f} 点；疲劳 {system.fatigue:.0f}/100；"
+        f"皮质醇 {system.hormones.get('cortisol', 50):.0f}、"
+        f"血清素 {system.hormones.get('serotonin', 50):.0f}、"
+        f"催产素 {system.hormones.get('oxytocin', 50):.0f}；"
+        f"累计睡眠债 {system.sleep_debt:.1f}h。请决定今晚作息。"
+    )
+    raw = await _call_consolidate_llm(
+        config, _PLAN_PROMPT, user_text, "hormone_sleep_plan", report=report
+    )
+    if raw is not None:
+        parsed = _parse_emotions(raw)
+        if isinstance(parsed, dict):
+            b = _hour_from(parsed.get("bedtime"))
+            d = _hour_from(parsed.get("duration_h"))
+            if b is not None and d is not None:
+                return {
+                    "bedtime": b,
+                    "duration_h": d,
+                    "note": str(parsed.get("note", "")),
+                    "source": "model",
+                }
+        logger.debug(f"作息计划无法解析，走兜底: {raw[:60]!r}")
+        if report is not None and not report.get("error"):
+            report["error"] = f"模型没给出能用的时间：{_reason(raw, 60)}"
+    return _fallback_plan(system)
+
+
+_NAP_PROMPT = (
+    "你在替'她'决定现在要不要补个觉。现在是白天、她安静了一阵、而且有点累或欠睡。\n"
+    "如果要，给一个 0.5–2 小时的小睡时长；不想睡就拒绝。睡太久会拖晚晚上入睡。\n"
+    '只输出 JSON，不要解释、不要 markdown。例：{"nap":true,"dur_h":1.0,"note":"有点困"}'
+)
+
+
+async def _generate_nap(
+    config: HormoneSystemConfig, system: HormoneSystem, report: dict | None = None
+) -> dict | None:
+    """用模型决定是否补觉及时长；失败返回 None（跳过，不强行补）。"""
+    now = time.time()
+    hour = system._hours_since_midnight(now)
+    user_text = (
+        f"现在 {hour:.2f} 点；疲劳 {system.fatigue:.0f}/100；"
+        f"睡眠债 {system.sleep_debt:.1f}h；安静 {(now - system.last_interaction_time)/60.0:.0f} 分钟。"
+    )
+    raw = await _call_consolidate_llm(
+        config, _NAP_PROMPT, user_text, "hormone_nap", report=report
+    )
+    if raw is None:
+        return None
+    parsed = _parse_emotions(raw)
+    if isinstance(parsed, dict):
+        dur = _hour_from(parsed.get("dur_h"))
+        if bool(parsed.get("nap")) and dur is not None:
+            return {"nap": True, "dur_h": dur, "note": str(parsed.get("note", ""))}
+        return {"nap": False, "dur_h": 0.0, "note": ""}
+    logger.debug(f"补觉决定无法解析: {raw[:60]!r}")
+    if report is not None:
+        report["error"] = f"模型没给出能用的补觉决定：{_reason(raw, 60)}"
+    return None
+
+
+def _dream_window_bounds(
+    system: HormoneSystem, now: float, config: HormoneSystemConfig
+) -> tuple[float, float] | None:
+    """now 所在睡眠窗的 (bed_ts, wake_ts)；跨午夜时自动匹配今夜/明夜。"""
+    cfg = config.sleep
+    if not cfg.consolidate:
+        return None
+    bed, wake = system._resolve_window(now)
+    span_h = (wake - bed) % 24.0 or 8.0
+    wake_ts0 = system._day_anchor(now, wake)
+    span_s = span_h * 3600.0
+    for off in (0.0, 86400.0):
+        wake_ts = wake_ts0 + off
+        bed_ts = wake_ts - span_s
+        if bed_ts <= now < wake_ts:
+            return bed_ts, wake_ts
+    return None
 
 
 class HormonePromptHandler(BaseEventHandler):
@@ -252,7 +475,8 @@ class HormonePromptHandler(BaseEventHandler):
         """从事件 values 提取用户消息文本。
 
         content 可能是 str 或 list[{"type":"text","text":...}]；
-        同时剥离 KFC 的 last-mile 指令尾段（--- 分隔符后的部分）。
+        先剥 KFC 的 last-mile 指令尾段（--- 分隔符后），
+        再把转发信封压成「昵称：正文」（打分与入梦原料共用这一份文本）。
         """
         content = HormonePromptHandler._extract_values_field(values, "content")
         if content is None:
@@ -272,7 +496,7 @@ class HormonePromptHandler(BaseEventHandler):
         if separator_idx >= 0:
             content = content[:separator_idx]
 
-        return content
+        return _normalize_relay_text(content)
 
     async def _score_with_llm(self, text: str, config: HormoneSystemConfig) -> dict[str, Any] | None:
         """用 LLM 给用户消息打情绪分；返回情绪通道 dict，失败/超时返回 None（调用方回退词典）。"""
@@ -389,6 +613,7 @@ class HormonePromptHandler(BaseEventHandler):
             logger.info(
                 f"状态={system.describe_state()} | 激素 {'  '.join(parts)} | "
                 f"疲劳={system.fatigue:.0f}({system.fatigue - before_fatigue:+.0f}) | "
+                f"{system.sleep_state_summary()} | "
                 f"会话={(stream_id or 'default')[:8]}"
             )
 
@@ -465,6 +690,44 @@ class HormoneSystemPlugin(BasePlugin):
         super().__init__(config)
         self._schedule_ids: list[str] = []
         self._register_task_id: str | None = None
+        self._state_sig: dict[str, str] = {}
+        self._state_ts: dict[str, float] = {}
+        self._sleep_notes: dict[str, Any] = {}
+
+    def _note_once(self, key: str, token: Any, message: str) -> bool:
+        """同一件事（同一夜 / 同一个梦窗）只说一遍，别每 10 分钟刷一行。"""
+        notes = getattr(self, "_sleep_notes", None)
+        if not isinstance(notes, dict):
+            notes = {}
+            self._sleep_notes = notes
+        if notes.get(key) == token:
+            return False
+        if len(notes) > 128:  # 长跑防泄漏：清掉重来（最多多说一句）
+            notes.clear()
+        notes[key] = token
+        logger.info(message)
+        return True
+
+    def _should_log_state(
+        self, sid: str, summ: str, now: float, config: HormoneSystemConfig
+    ) -> bool:
+        """[State] 日志节流：状态变化立即打，否则按 state_log_minutes 打心跳。"""
+        sig_map = getattr(self, "_state_sig", None)
+        if not isinstance(sig_map, dict):
+            sig_map = {}
+            self._state_sig = sig_map
+        ts_map = getattr(self, "_state_ts", None)
+        if not isinstance(ts_map, dict):
+            ts_map = {}
+            self._state_ts = ts_map
+        prev = sig_map.get(sid)
+        last = ts_map.get(sid, 0.0)
+        heartbeat = float(config.sleep.state_log_minutes) * 60.0
+        if prev == summ and (heartbeat <= 0.0 or now - last < heartbeat):
+            return False
+        sig_map[sid] = summ
+        ts_map[sid] = now
+        return True
 
     def get_components(self) -> list[type]:
         """返回插件提供的组件类列表。"""
@@ -479,7 +742,9 @@ class HormoneSystemPlugin(BasePlugin):
         cfg = getattr(self, "config", None)
         if not isinstance(cfg, HormoneSystemConfig):
             return
-        if not cfg.sleep.consolidate:
+        if not (
+            cfg.sleep.consolidate or cfg.sleep.dynamic_schedule or cfg.sleep.nap_enabled
+        ):
             return
         from src.kernel.concurrency import get_task_manager
 
@@ -492,11 +757,16 @@ class HormoneSystemPlugin(BasePlugin):
         self._register_task_id = task.task_id
 
     async def _register_schedule_when_ready(self) -> None:
-        """等待 scheduler 启动后注册临醒前梦生成周期任务（scheduler 在 run() 才 start）。"""
+        """等待 scheduler 启动后注册睡眠后台任务（scheduler 在 run() 才 start）。"""
         from src.kernel.scheduler import TriggerType, get_unified_scheduler
 
         cfg = self.config
-        interval = max(60, int(cfg.sleep.dream_check_minutes) * 60)
+        interval_min = min(
+            int(cfg.sleep.plan_check_minutes),
+            int(cfg.sleep.nap_check_minutes),
+            int(cfg.sleep.dream_check_minutes),
+        )
+        interval = max(60, interval_min * 60)
         while True:
             try:
                 scheduler = get_unified_scheduler()
@@ -509,7 +779,7 @@ class HormoneSystemPlugin(BasePlugin):
                     force_overwrite=True,
                 )
                 self._schedule_ids = [sid]
-                logger.info(f"hormone_system 梦生成任务已注册: {sid}（每 {interval // 60} 分钟检查临醒窗口）")
+                logger.info(f"hormone_system 睡眠后台任务已注册: {sid}（每 {interval // 60} 分钟看一眼：定作息 / 熟睡中段做梦 / 要不要补觉）")
                 return
             except RuntimeError:
                 await asyncio.sleep(0.5)
@@ -518,9 +788,13 @@ class HormoneSystemPlugin(BasePlugin):
                 return
 
     async def _consolidate_job(self) -> None:
-        """周期任务：临醒窗口内为各 stream 生成当晚的梦；模型调用在锁外，避免阻塞回复。"""
+        """周期任务：给各 stream 定今晚作息 / 生成当晚的梦（模型调用均在锁外）。"""
         cfg = getattr(self, "config", None)
-        if not isinstance(cfg, HormoneSystemConfig) or not cfg.sleep.consolidate:
+        if not isinstance(cfg, HormoneSystemConfig):
+            return
+        if not (
+            cfg.sleep.consolidate or cfg.sleep.dynamic_schedule or cfg.sleep.nap_enabled
+        ):
             return
         store = HormoneStateStore(cfg.core.state_dir)
         now = time.time()
@@ -530,30 +804,171 @@ class HormoneSystemPlugin(BasePlugin):
             if not fn.endswith(".json"):
                 continue
             sid = fn[:-5]
+            key = store.state_path(sid)
+            now = time.time()  # 每条 stream 用最新时刻，避免多流+模型耗时导致 now 过期
             try:
-                key = store.state_path(sid)
-                # 临界区1（短，不含网络）：读态 + 判窗口 + 去重 + 取原料
+                # ---- 作息计划段 ----
+                need_plan = False
+                dropped_pd = False
+                probe: HormoneSystem | None = None
+                async with _lock_for(key):
+                    data = store.load(sid)
+                    if data:
+                        probe = HormoneSystem(cfg)
+                        probe.apply_state(data)
+                        # 死草稿清理：>24h 还没等到醒来的梦，别一直躺在状态文件里
+                        dropped_pd = probe.drop_expired_pending(now)
+                        need_plan = probe.should_plan_sleep(now)
+                        _summ = probe.sleep_state_summary()
+                        if self._should_log_state(sid, _summ, now, cfg):
+                            logger.info(f"[State] stream={sid[:8]} {_summ}")
+                        if dropped_pd:
+                            store.save(sid, probe.to_state(cfg.core.state_version))
+                if dropped_pd:
+                    self._note_once(
+                        f"{sid}:pd-expired",
+                        probe._today_key(now) if probe is not None else 0,
+                        f"[Dream] stream={sid[:8]} 上一场梦没等到醒来确认（超过一天），草稿丢了",
+                    )
+                if need_plan and probe is not None:
+                    plan_rep: dict = {}
+                    plan_gen = await _generate_sleep_plan(cfg, probe, report=plan_rep)
+                    async with _lock_for(key):
+                        fresh = store.load(sid) or {}
+                        psys = HormoneSystem(cfg)
+                        if fresh:
+                            psys.apply_state(fresh)
+                        if psys._resolve_plan(now) is None:  # 二次去重
+                            psys.apply_sleep_plan(
+                                plan_gen["bedtime"],
+                                plan_gen["duration_h"],
+                                plan_gen.get("source", "fallback"),
+                                plan_gen.get("note", ""),
+                                now,
+                            )
+                            store.save(sid, psys.to_state(cfg.core.state_version))
+                            logger.info(f"[Plan] stream={sid[:8]} {psys.sleep_state_summary()}")
+                    if plan_gen.get("source") != "model":
+                        self._note_once(
+                            f"{sid}:plan",
+                            probe._night_key(now),
+                            f"[Plan] stream={sid[:8]} 今晚作息没问成模型，改按身体情况自己定了："
+                            f"{plan_rep.get('error') or '原因不明'}",
+                        )
+
+                # ---- 补觉段 ----
+                if cfg.sleep.nap_enabled and cfg.sleep.nap_per_day > 0:
+                    nap_due = False
+                    nap_probe: HormoneSystem | None = None
+                    async with _lock_for(key):
+                        data = store.load(sid)
+                        if data:
+                            nprobe = HormoneSystem(cfg)
+                            nprobe.apply_state(data)
+                            changed = False
+                            if isinstance(nprobe.nap, dict) and now >= float(
+                                nprobe.nap.get("wake_ts", 0.0)
+                            ):
+                                nprobe._finalize_nap(now)  # 到点自然醒
+                                changed = True
+                            nap_due = nprobe.should_nap(now)
+                            if changed:
+                                store.save(sid, nprobe.to_state(cfg.core.state_version))
+                            nap_probe = nprobe
+                    if nap_due and nap_probe is not None:
+                        nap_gen = await _generate_nap(cfg, nap_probe)
+                        async with _lock_for(key):
+                            fresh = store.load(sid) or {}
+                            nsys = HormoneSystem(cfg)
+                            if fresh:
+                                nsys.apply_state(fresh)
+                            can_start = (
+                                nsys.nap is None
+                                and nsys.nap_date != nsys._today_key(now)
+                            )
+                            nsys.nap_check_ts = now  # 不论答应与否，冷却后再问
+                            if nap_gen and nap_gen.get("nap") and can_start:
+                                nsys.start_nap(
+                                    float(nap_gen.get("dur_h", 1.0)), "model", now
+                                )
+                                logger.info(f"[Nap] stream={sid[:8]} {nsys.sleep_state_summary()}")
+                            store.save(sid, nsys.to_state(cfg.core.state_version))
+
+                # ---- 梦生成段（仅 consolidate）----
+                if not cfg.sleep.consolidate:
+                    continue
+                items: list[dict] = []
+                tone: str | None = None
+                window_start = 0.0
+                blocked = ""
+                blocked_code = ""
                 async with _lock_for(key):
                     data = store.load(sid)
                     if not data:
                         continue
-                    probe = HormoneSystem(cfg)
-                    probe.apply_state(data)
-                    if not _in_pre_wake_window(probe, now, cfg):
+                    probe2 = HormoneSystem(cfg)
+                    probe2.apply_state(data)
+                    bounds = _dream_window_bounds(probe2, now, cfg)
+                    if bounds is None:
                         continue
-                    window_start = probe._day_anchor(
-                        now, max(cfg.sleep.wake_time - cfg.sleep.dream_pre_wake_hours, 0.0)
+                    window_start, wake_ts = bounds
+                    span_s = wake_ts - window_start
+                    frac = (now - window_start) / span_s
+                    if not (
+                        float(cfg.sleep.dream_mid_start_ratio)
+                        <= frac
+                        < float(cfg.sleep.dream_mid_end_ratio)
+                    ):
+                        continue
+                    quiet = (now - probe2.last_interaction_time) / 60.0
+                    onset = float(cfg.sleep.sleep_onset_gap_minutes)
+                    if quiet < onset:
+                        blocked = (
+                            f"到该做梦的点了，但她还在聊（才安静 {int(quiet)} 分钟，"
+                            f"要满 {onset:.0f} 分钟才算睡着）"
+                        )
+                        blocked_code = "chatting"
+                    else:
+                        gd = probe2.gen_dream
+                        pd = probe2.pending_dream
+                        if (
+                            isinstance(gd, dict)
+                            and float(gd.get("ts", 0.0)) >= window_start
+                        ) or (
+                            isinstance(pd, dict)
+                            and float(pd.get("gen_ts", 0.0)) >= window_start
+                        ):
+                            blocked = "今晚已经做过一个梦了"  # 本窗口已生成过（含未转正草稿）
+                            blocked_code = "done"
+                        else:
+                            items, tone = probe2.get_generation_input()
+                            if not items:
+                                blocked = "今天没留下能入梦的事"
+                                blocked_code = "no-material"
+                            elif tone in (None, "nightmare"):
+                                blocked = "今天的事压成了噩梦，走潜意识阴影那条线"
+                                blocked_code = "nightmare"
+                if blocked:
+                    # 节流键用稳定 code（不能带分钟数，否则每轮都被当成"新原因"）
+                    self._note_once(
+                        f"{sid}:dream",
+                        (window_start, blocked_code),
+                        f"[Dream] stream={sid[:8]} 今晚不做梦：{blocked}",
                     )
-                    gd = probe.gen_dream
-                    if isinstance(gd, dict) and float(gd.get("ts", 0.0)) >= window_start:
-                        continue  # 本窗口已生成过
-                    items, tone = probe.get_generation_input()
-                    if not items or tone in (None, "nightmare"):
-                        continue  # 噩梦交回既有阴影路径；无原料不生成
+                    continue
+                if not items or tone is None:
+                    continue
 
                 # 锁外调模型（可能耗时）→ 不占用 stream 锁、不阻塞回复
-                gen = await _generate_dream(cfg, items, tone)
+                dream_rep: dict = {}
+                gen = await _generate_dream(cfg, items, tone, report=dream_rep)
                 if not gen:
+                    self._note_once(
+                        f"{sid}:dreamfail",
+                        window_start,
+                        f"[Dream] stream={sid[:8]} 熟睡里想酿一个梦，没成："
+                        f"{dream_rep.get('error') or '模型没给内容'}",
+                    )
                     continue
 
                 # 临界区2（短）：重载最新态 → 二次去重 → 应用 → 存
@@ -563,15 +978,26 @@ class HormoneSystemPlugin(BasePlugin):
                     if fresh:
                         system.apply_state(fresh)
                     gd2 = system.gen_dream
-                    if isinstance(gd2, dict) and float(gd2.get("ts", 0.0)) >= window_start:
+                    pd2 = system.pending_dream
+                    if (
+                        isinstance(gd2, dict)
+                        and float(gd2.get("ts", 0.0)) >= window_start
+                    ) or (
+                        isinstance(pd2, dict)
+                        and float(pd2.get("gen_ts", 0.0)) >= window_start
+                    ):
                         continue  # 等模型这段时间里可能已生成过
-                    system.apply_generated_dream(gen["dream"], tone, gen["recall"], gen["worth"])
+                    system.set_pending_dream(gen["dream"], tone)
                     store.save(sid, system.to_state(cfg.core.state_version))
+                    tone_cn = {
+                        "sweet": "甜", "neutral": "中性",
+                        "ambivalent": "甜虐", "nightmare": "噩梦",
+                    }.get(tone, tone)
                     logger.info(
-                        f"[Dream] stream={sid[:8]} tone={tone} recall={gen['recall']} worth={gen['worth']}"
+                        f"[DreamPend] stream={sid[:8]} 熟睡中做了个{tone_cn}的梦，醒来再判定记不记得/值不值得记"
                     )
             except Exception as exc:  # noqa: BLE001 - 单流失败不影响其它流
-                logger.warning(f"梦生成处理 stream {sid[:8]} 失败: {exc}")
+                logger.warning(f"睡眠任务处理 stream {sid[:8]} 失败: {exc}")
                 continue
 
     async def on_plugin_unloaded(self) -> None:

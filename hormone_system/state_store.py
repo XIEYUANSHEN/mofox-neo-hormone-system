@@ -13,7 +13,15 @@ import logging
 import os
 import re
 
-logger = logging.getLogger("hormone_system")
+try:
+    # 使用框架日志接口：enable_event_broadcast 会把日志广播到后台日志面板
+    from src.app.plugin_system.api.log_api import get_logger
+
+    logger = get_logger("hormone_system", display="赛博内分泌")
+except Exception:  # pragma: no cover - 仅在脱离框架跑离线单测时生效
+    import logging
+
+    logger = logging.getLogger("hormone_system")
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9_\-]")
 _MAX_ID_LEN = 64
@@ -31,6 +39,7 @@ class HormoneStateStore:
     """单个 stream 状态文件的读写（原子写、损坏宽容）。"""
 
     def __init__(self, state_dir: str = "data/plugins/hormone_system") -> None:
+        """初始化状态存储目录。"""
         self._state_dir = state_dir
 
     @property
@@ -56,7 +65,7 @@ class HormoneStateStore:
                 raise ValueError("状态文件根节点不是对象")
             return data
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            logger.warning("激素状态文件损坏，将重置为基线 (%s): %s", path, exc)
+            logger.warning(f"激素状态文件损坏，将重置为基线 ({path}): {exc}")
             return None
 
     def save(self, stream_id: str, state: dict) -> None:
@@ -69,4 +78,4 @@ class HormoneStateStore:
                 json.dump(state, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
         except OSError as exc:
-            logger.warning("激素状态保存失败 (%s): %s", path, exc)
+            logger.warning(f"激素状态保存失败 ({path}): {exc}")

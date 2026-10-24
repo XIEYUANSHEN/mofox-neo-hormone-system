@@ -149,6 +149,30 @@ _SLEEP_TONE = {
 }
 
 
+def _sleep_tone_line(system: "HormoneSystem", phase: str) -> str:
+    """相位语气行。
+
+    收尾期特例：她今晚自己定了就寝点，而 wind_down 从「就寝点−wind_down_hours」
+    就开始灌困意——不给钟点她会凭感觉提前道晚安，把自己定的时间说过头。
+    """
+    if phase == "wind_down":
+        try:
+            plan = system._resolve_plan(time.time())
+        except Exception:  # noqa: BLE001 - 拿不到就退回通用文案
+            plan = None
+        if isinstance(plan, dict):
+            try:
+                bed = system._fmt_hour(float(plan.get("bedtime")))
+            except (TypeError, ValueError):
+                bed = ""
+            if bed:
+                return (
+                    f"【夜渐深，你有点犯困了；不过今晚是你自己定的{bed}才睡，"
+                    "还没到点，短一点软一点可以，不至于这会儿就道晚安。】"
+                )
+    return _SLEEP_TONE.get(phase, "")
+
+
 def _clean_dream(text: str) -> str:
     """梦文本护栏：含阿拉伯数字或激素名一律判废（返回空串），守无数字/无激素名铁律。"""
     if not text:
@@ -159,6 +183,27 @@ def _clean_dream(text: str) -> str:
         if w in text:
             return ""
     return text.strip()
+
+
+def _debt_line(system: "HormoneSystem", config: HormoneSystemConfig) -> str:
+    """睡眠债/昨晚类型的身体感（只说感受，不说教、无数字、无激素名）。"""
+    if not getattr(config.sleep, "sleep_debt_enabled", False):
+        return ""
+    debt = float(getattr(system, "sleep_debt", 0.0) or 0.0)
+    kind = str(getattr(system, "last_sleep_kind", ""))
+    if kind == "allnighter":
+        return "- 整夜几乎没合眼，现在亢奋里透着空、反应有点慢。"
+    if kind == "oversleep":
+        return "- 睡得有点过头，脑子昏昏沉沉的。"
+    if kind == "catchup":
+        return "- 补了一觉，缓过来一点，但身上还留着点倦。"
+    if debt > 4.0:
+        return "- 连着几天没睡够，脑袋发沉、容易烦躁。"
+    if debt > 2.0:
+        return "- 还有点没缓过来，精力不太够。"
+    if kind == "short":
+        return "- 昨晚没睡够，有点发沉。"
+    return ""
 
 
 def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: str) -> list[str]:
@@ -219,7 +264,11 @@ def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: st
                         else:
                             lines.append("【昨晚好像做了个梦】：" + safe + "，提不提都行。")
 
-        tone_line = _SLEEP_TONE.get(phase, "")
+        debt_line = _debt_line(system, config)
+        if debt_line:
+            lines.append(debt_line)
+
+        tone_line = _sleep_tone_line(system, phase)
         if tone_line:
             lines.append(tone_line)
     except Exception:
@@ -247,15 +296,28 @@ def build_mood_prompt(
     # 预留收尾行的长度，保证整段不超预算
     tail_budget = MAX_PROMPT_CHARS - len(_TAIL_LINE) - 1
 
+    # 睡眠段（梦 / 起床气 / 睡眠债 / 相位语气）比单条激素行更重要：
+    # 先算出来并给它留好位置，免得激素行一多就把"昨晚梦见你了"挤掉。
+    try:
+        phase = system.current_sleep_phase()
+    except Exception:
+        phase = ""
+    sleep_lines = [line for line in _sleep_lines(system, config, phase) if line]
+    reserve = sum(len(line) + 1 for line in sleep_lines)
+
     def _fits(lines: list[str], line: str) -> bool:
         """判断追加一行后是否仍在字数预算内。"""
         return len("\n".join(lines + [line])) <= tail_budget
+
+    def _fits_hormone(lines: list[str], line: str) -> bool:
+        """激素行还要扣掉给睡眠段预留的位置。"""
+        return len("\n".join(lines + [line])) + reserve <= tail_budget
 
     def _build(order: list[tuple[str, str]]) -> list[str]:
         """按给定顺序构建行列表，超预算的行跳过。"""
         out = list(fixed)
         for _, line in order:
-            if _fits(out, line):
+            if _fits_hormone(out, line):
                 out.append(line)
         return out
 
@@ -269,7 +331,7 @@ def build_mood_prompt(
     out_probe = list(fixed)
     all_fit = True
     for _, line in canonical:
-        if not _fits(out_probe, line):
+        if not _fits_hormone(out_probe, line):
             all_fit = False
             break
         out_probe.append(line)
@@ -278,15 +340,9 @@ def build_mood_prompt(
     )
     lines = list(out_probe) if all_fit else _build(by_deviation)
 
-    # 睡眠相位：纯时间判定，无消息回合（续轮/超时）也准确
-    try:
-        phase = system.current_sleep_phase()
-    except Exception:
-        phase = ""
-
-    # 可选段优先级：睡眠 → 慢性状态 → 综合状态 → 独处感知
-    for line in _sleep_lines(system, config, phase):
-        if line and _fits(lines, line):
+    # 可选段优先级：睡眠 → 慢性状态 → 综合状态 → 独处感知（睡眠段已预留位置）
+    for line in sleep_lines:
+        if _fits(lines, line):
             lines.append(line)
 
     if getattr(config.chronic_states, "enabled", False):

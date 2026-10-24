@@ -11,6 +11,7 @@ class SentimentScorer:
     """基于中文词典的轻量情感打分器。"""
 
     def __init__(self) -> None:
+        """初始化正向/负向词表、否定词与亲昵豁免词。"""
         self.pos_words = {"棒", "可爱", "喜欢", "厉害", "好耶", "不错",
                           "爱你", "么么哒", "谢谢", "优秀", "牛",
                           "一定行", "可以的", "稳了"}
@@ -46,6 +47,7 @@ class SentimentScorer:
 
     @staticmethod
     def _is_inside(pos: int, positions: list[tuple[int, int]]) -> bool:
+        """判断位置是否落在任一区间内。"""
         for s, e in positions:
             if s <= pos < e:
                 return True

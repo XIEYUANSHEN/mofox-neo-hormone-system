@@ -77,7 +77,7 @@ class HormoneSystemConfig(BaseConfig):
             description="消息历史上限（预留参数，第一版未使用）",
         )
         state_version: int = Field(
-            default=2,
+            default=3,
             description="状态文件版本号",
         )
 
@@ -133,10 +133,10 @@ class HormoneSystemConfig(BaseConfig):
             description="起床时间（小时）",
         )
         wind_down_hours: float = Field(
-            default=1.5,
+            default=0.5,
             ge=0.0,
             le=6.0,
-            description="睡前多少小时开始犯困",
+            description="睡前多久开始进入「犯困收尾」的语气；默认半小时（定太长她会提前道晚安）",
         )
         groggy_hours: float = Field(
             default=1.0,
@@ -156,19 +156,31 @@ class HormoneSystemConfig(BaseConfig):
         )
         consolidate_model_task: str = Field(
             default="",
-            description="整理/生成用的模型任务名（对应 model.toml 的 [model_tasks.xxx]）；留空 = 跟随主回复模型(actor)",
+            description="整理/生成用的模型任务名（对应 model.toml 的 [model_tasks.xxx]）；留空 = 从主回复模型(actor)起；首选没成会自动退到 sub_actor/utils_small/utils 备用任务",
         )
         dream_pre_wake_hours: float = Field(
             default=1.0,
             ge=0.0,
             le=4.0,
-            description="临醒前多久由定时任务生成当晚的梦",
+            description="（已弃用，保留兼容）旧版临醒前生成窗口；现改为熟睡中段生成",
+        )
+        dream_mid_start_ratio: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=0.9,
+            description="梦在睡眠窗的这个比例之后开始生成（0.3=30% 处）",
+        )
+        dream_mid_end_ratio: float = Field(
+            default=0.7,
+            ge=0.1,
+            le=1.0,
+            description="梦生成窗口的结束比例（0.7=70% 处）",
         )
         dream_check_minutes: int = Field(
             default=15,
             ge=5,
             le=60,
-            description="定时任务检查间隔（分钟）；落在临醒窗口才真正生成",
+            description="定时任务检查间隔（分钟）；落在熟睡窗口才生成梦",
         )
         journal_max_days: int = Field(
             default=3,
@@ -188,15 +200,181 @@ class HormoneSystemConfig(BaseConfig):
             le=100,
             description="recent_turns 原料缓冲上限",
         )
+        turn_clip_chars: int = Field(
+            default=120,
+            ge=20,
+            le=400,
+            description="单条入梦原料保留的正文长度（已剥掉转发信封；120≈一到两句完整的话）",
+        )
         consolidate_timeout_seconds: float = Field(
-            default=15.0,
+            default=25.0,
             ge=1.0,
             le=60.0,
-            description="整理/生成调用超时（秒），超时跳过今晚",
+            description="单个模型任务一次的等待上限（秒），超了就换下一个备用任务",
+        )
+        consolidate_total_seconds: float = Field(
+            default=60.0,
+            ge=5.0,
+            le=180.0,
+            description="整理/生成调用的总时间预算（秒，跨备选模型任务共享）；到点就跳过这一轮",
         )
         inject_journal: bool = Field(
             default=True,
             description="是否把生成的梦/「心里记着的事」渗进心境 prompt",
+        )
+        sleep_onset_gap_minutes: int = Field(
+            default=30,
+            ge=0,
+            le=180,
+            description="睡眠窗内来消息，需距上次互动安静≥此分钟数才判「被吵醒」；0=旧行为（窗内即算吵醒）",
+        )
+        target_sleep_hours: float = Field(
+            default=6.0,
+            ge=1.0,
+            le=14.0,
+            description="推荐睡眠时长 / 缺额基准（债按它算）",
+        )
+        sleep_debt_enabled: bool = Field(
+            default=True,
+            description="是否启用睡眠债（关=不累计、不影响基线）",
+        )
+        sleep_debt_cap_hours: float = Field(
+            default=12.0,
+            ge=1.0,
+            le=48.0,
+            description="睡眠债上限，防无限累积",
+        )
+        debt_decay_per_night: float = Field(
+            default=0.8,
+            ge=0.0,
+            le=4.0,
+            description="每夜身体自然消退的睡眠债（小时）",
+        )
+        oversleep_margin_hours: float = Field(
+            default=2.5,
+            ge=0.0,
+            le=6.0,
+            description="睡超过 target+此值判「睡太多→睡懵」",
+        )
+        dynamic_schedule: bool = Field(
+            default=True,
+            description="是否让她每天自定作息（关=用固定 bedtime/wake_time）",
+        )
+        timezone: str = Field(
+            default="Asia/Shanghai",
+            description="睡眠判定所用时区（空/非法回退服务器本地）",
+        )
+        night_bucket_start: float = Field(
+            default=18.0,
+            ge=0.0,
+            le=24.0,
+            description="夜桶起点（测量睡眠的宽带上界），默认 18:00",
+        )
+        night_bucket_end: float = Field(
+            default=12.0,
+            ge=0.0,
+            le=24.0,
+            description="夜桶终点（次日），默认 12:00",
+        )
+        plan_at: float = Field(
+            default=21.5,
+            ge=0.0,
+            le=24.0,
+            description="每晚几点之后可以开始定今晚作息",
+        )
+        plan_check_minutes: int = Field(
+            default=10,
+            ge=5,
+            le=60,
+            description="作息/补觉检查轮询间隔（分钟）",
+        )
+        plan_sane_min_hours: float = Field(
+            default=1.0,
+            ge=0.1,
+            le=6.0,
+            description="计划时长防呆下限（不是政策）",
+        )
+        plan_sane_max_hours: float = Field(
+            default=12.0,
+            ge=6.0,
+            le=24.0,
+            description="计划时长防呆上限（不是政策）",
+        )
+        earliest_bedtime: float = Field(
+            default=20.0,
+            ge=0.0,
+            le=24.0,
+            description="就寝防呆早限（20:00），非政策",
+        )
+        latest_bedtime: float = Field(
+            default=30.0,
+            ge=12.0,
+            le=36.0,
+            description="就寝防呆晚限（>24 表示次日，30=次日06:00），非政策",
+        )
+        nap_enabled: bool = Field(
+            default=True,
+            description="是否允许她白天主动补觉（nap）",
+        )
+        nap_check_minutes: int = Field(
+            default=20,
+            ge=5,
+            le=120,
+            description="补觉检查轮询间隔（分钟）",
+        )
+        nap_quiet_minutes: int = Field(
+            default=40,
+            ge=10,
+            le=240,
+            description="安静多久后才考虑补觉",
+        )
+        nap_min_hours: float = Field(
+            default=0.5,
+            ge=0.1,
+            le=4.0,
+            description="最短补觉",
+        )
+        nap_max_hours: float = Field(
+            default=2.0,
+            ge=0.5,
+            le=6.0,
+            description="最长补觉（超过会拖晚夜睡）",
+        )
+        nap_repay_factor: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description="补觉回补睡眠债的折扣（低于夜睡）",
+        )
+        nap_per_day: int = Field(
+            default=1,
+            ge=0,
+            le=3,
+            description="每天最多补几次",
+        )
+        nap_fatigue_threshold: float = Field(
+            default=60.0,
+            ge=0.0,
+            le=100.0,
+            description="疲劳超过此才考虑补觉",
+        )
+        nap_debt_threshold: float = Field(
+            default=2.0,
+            ge=0.0,
+            le=24.0,
+            description="睡眠债超过此才考虑补觉",
+        )
+        nap_recheck_minutes: int = Field(
+            default=60,
+            ge=10,
+            le=360,
+            description="问过模型要不要补觉后的冷却（分钟），不论答应与否；防每轮重复调用",
+        )
+        state_log_minutes: float = Field(
+            default=30.0,
+            ge=0.0,
+            le=1440.0,
+            description="后台[State]状态日志的心跳间隔（分钟）；状态有变化时立即打，0=只打变化",
         )
 
     @config_section("topic")

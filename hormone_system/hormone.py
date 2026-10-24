@@ -14,7 +14,13 @@ import logging
 import math
 import random
 import time
+from datetime import datetime, timedelta, tzinfo
 from typing import Any
+
+try:  # 时区（stdlib，缺 tzdata 时回退本地）
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 from .config import HormoneSystemConfig
 from .scorer import SentimentScorer
@@ -163,6 +169,14 @@ class HormoneSystem:
         self.recent_turns: list[dict] = []        # 仅 consolidate=true 时缓冲的原料
         self.sleep_journal: list[dict] = []       # 小本本（有界环形）
         self.gen_dream: dict | None = None        # 生成的非噩梦 {text,tone,recall,worth,ts}
+        self.sleep_debt: float = 0.0              # 睡眠债（小时）
+        self.last_sleep_kind: str = ""            # 最近一晚类型：allnighter/short/normal/catchup/oversleep
+        self.sleep_plan: dict | None = None       # 今晚自定作息 {night_key,bedtime,dur_h,wake,decided_at,source,note}
+        self.nap: dict | None = None              # 补觉 session {start_ts,wake_ts,dur_h,source}
+        self.nap_date: str = ""                   # 最近补觉归属日期（限每天次数）
+        self.nap_check_ts: float = 0.0            # 上次询问是否补觉的时刻（冷却用）
+        self.pending_dream: dict | None = None    # 梦草稿，晨间结算转正/丢弃
+        self._state_loaded: bool = False          # 是否从磁盘载入过历史状态（首启不结算）
         self.scorer = SentimentScorer()
 
     # ---------- 基础工具 ----------
@@ -301,6 +315,8 @@ class HormoneSystem:
         if self._cfg.sleep.enabled:
             sleep_stage = self._apply_sleep(pre_decay_hormones, pre_decay_time)
         self._sleep_stage = sleep_stage
+        # 睡眠债的持续影响：债没还清时抬高皮质醇底线/压低血清素上限
+        self._apply_debt_bounds()
 
         # 消耗起床缓冲：每结算一轮减一，归零后清空起床气文案
         if self.wake_up_turns > 0:
@@ -604,47 +620,141 @@ class HormoneSystem:
             f"（催产素{oxy * scale:+.1f} 血清素{ser * scale:+.1f}）"
         )
 
-    # ---------- 睡眠节律 ----------
-    @staticmethod
-    def _hours_since_midnight(ts: float) -> float:
-        """把时间戳转成当天 0 点起的小时数（本地时区）。"""
-        lt = time.localtime(ts)
-        return lt.tm_hour + lt.tm_min / 60.0 + lt.tm_sec / 3600.0
+    # ---------- 睡眠节律 / 时区 / 夜归属 ----------
+    def _tz(self) -> tzinfo | None:
+        """配置的时区；空/非法/缺 tzdata 时返回 None（用本地时区）。"""
+        name = (self._cfg.sleep.timezone or "").strip()
+        if not name or ZoneInfo is None:
+            return None
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            return None
 
-    @staticmethod
-    def _day_anchor(ts: float, hour: float) -> float:
-        """今天 hour 点整的时间戳（本地时区），hour 可为小数。"""
-        lt = time.localtime(ts)
-        day_start = ts - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
-        return day_start + hour * 3600.0
+    def _hours_since_midnight(self, ts: float) -> float:
+        """时间戳转当天 0 点起的小时数（配置时区，回退本地）。"""
+        dt = datetime.fromtimestamp(ts, self._tz())
+        return dt.hour + dt.minute / 60.0 + dt.second / 3600.0
 
-    def _in_sleep_window(self, hour: float) -> bool:
-        """hour 是否落在 [bedtime, wake_time) 睡眠窗口（支持跨午夜）。"""
+    def _day_anchor(self, ts: float, hour: float) -> float:
+        """当天 hour 点整的时间戳（配置时区），hour 可跨午夜。"""
+        dt = datetime.fromtimestamp(ts, self._tz())
+        day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (day_start + timedelta(hours=hour)).timestamp()
+
+    def _night_bounds(self, now: float) -> tuple[float, float]:
+        """now 所属「夜桶」的 [start_ts, end_ts]（默认 18:00 → 次日 12:00）。"""
         cfg = self._cfg.sleep
-        if abs(cfg.bedtime - cfg.wake_time) < 1e-6:
-            return False  # 未配置有效作息
-        if cfg.bedtime < cfg.wake_time:
-            return cfg.bedtime <= hour < cfg.wake_time
-        return hour >= cfg.bedtime or hour < cfg.wake_time
+        start_h = float(cfg.night_bucket_start)
+        span_h = (float(cfg.night_bucket_end) - start_h) % 24.0
+        if span_h <= 0.0:
+            span_h = 12.0
+        hour = self._hours_since_midnight(now)
+        ref = now if hour >= start_h else now - 86400.0
+        start_ts = self._day_anchor(ref, start_h)
+        return start_ts, start_ts + span_h * 3600.0
+
+    def _night_key(self, now: float) -> str:
+        """夜归属日期（夜桶起始日），用于 sleep_plan 匹配。"""
+        start_ts, _ = self._night_bounds(now)
+        return datetime.fromtimestamp(start_ts, self._tz()).date().isoformat()
+
+    def _resolve_plan(self, now: float) -> dict | None:
+        """属于当前夜的 sleep_plan；没有/不属于今夜 → None。"""
+        plan = self.sleep_plan
+        if not isinstance(plan, dict):
+            return None
+        if plan.get("night_key") != self._night_key(now):
+            return None
+        return plan
+
+    def _resolve_window(self, now: float) -> tuple[float, float]:
+        """返回 (bedtime, wake)：有 plan 用 plan，否则用 config 兜底。"""
+        plan = self._resolve_plan(now)
+        if plan:
+            try:
+                return float(plan["bedtime"]), float(plan["wake"])
+            except (KeyError, TypeError, ValueError):
+                pass
+        cfg = self._cfg.sleep
+        return cfg.bedtime, cfg.wake_time
+
+    def _in_window(self, now: float, bedtime: float, wake: float) -> bool:
+        """now 是否落在 [bedtime, wake)（支持跨午夜）。"""
+        if abs(bedtime - wake) < 1e-6:
+            return False
+        hour = self._hours_since_midnight(now)
+        b = bedtime % 24.0
+        w = wake % 24.0
+        if b < w:
+            return b <= hour < w
+        return hour >= b or hour < w
+
+    def _quiet_slept(
+        self, start: float, end: float, bedtime: float, wake: float
+    ) -> float:
+        """[start,end] 在「本夜就寝→起床」内的安静小时数（封顶 14h）。
+
+        就寝前的安静不算睡眠（她可能只是没聊）；允许半小时早睡宽限；
+        睡眠终点封顶在计划起床点，起床后到发消息的空档不算睡。
+        """
+        if end <= start:
+            return 0.0
+        wake_ts = self._day_anchor(end, wake)
+        span_h = (wake - bedtime) % 24.0
+        if span_h <= 0.0:
+            span_h = 8.0
+        bed_ts = wake_ts - span_h * 3600.0
+        lo = max(start, bed_ts - 0.5 * 3600.0)
+        hi = min(end, wake_ts)
+        if hi <= lo:
+            return 0.0
+        return min(14.0, (hi - lo) / 3600.0)
 
     def _apply_sleep(self, pre_snap: dict, pre_time: float) -> str:
         """按当前时刻结算睡眠节律，返回本轮睡眠阶段。
 
-        阶段与影响：
-          night_wake 睡眠窗口内来消息被吵醒：首次有起床气（皮质醇升、血清素/多巴胺降）
-          woken      起床后 groggy_hours 内：刚睡醒的迷糊
-          wind_down  睡前 wind_down_hours：困意上涌（仅注入心境，不动激素值）
-        另：跨过起床点后一次性结算昨晚睡眠——用睡前快照(pre_snap)判定睡眠质量
-        （焦虑/低落/失眠），坏睡回写皮质醇升、多巴胺/血清素/内啡肽降并留梦境，
-        好睡向基线重置并补催产素/内啡肽；睡眠时长由 pre_time→now 落在作息窗口的
-        重叠小时推得，被吵醒过会显著拉低质量。
+        v0.4：窗口优先读 sleep_plan（无则 config）；只有"她已定作息且真的睡过去
+        （安静够久）"才判被吵醒；自定作息开启但今晚还没定时，不判吵醒。
+        睡眠时长按夜桶内真实安静跨度测量，不再卡计划窗。
         """
         cfg = self._cfg.sleep
         now = time.time()
         hour = self._hours_since_midnight(now)
 
-        # 夜里来消息 = 被吵醒；同一夜的后续消息不再重复施加强反应
-        if self._in_sleep_window(hour):
+        # 补觉中：nap 期间来消息 = 被吵醒（轻）；到点自然醒
+        if isinstance(self.nap, dict):
+            wake_ts = float(self.nap.get("wake_ts", 0.0))
+            if now < wake_ts:
+                gap_min = (now - pre_time) / 60.0
+                if gap_min >= cfg.sleep_onset_gap_minutes:
+                    self._finalize_nap(now)
+                    self._bump("cortisol", 4.0)
+                    self._bump("dopamine", -3.0)
+                    self.fatigue = self._clamp(self.fatigue + 2.0, 0.0, 100.0, 0.0)
+                    return "nap_wake"
+                return "napping"
+            self._finalize_nap(now)
+
+        plan = self._resolve_plan(now)
+        dynamic = bool(cfg.dynamic_schedule)
+        allow_wake = (not dynamic) or (plan is not None)
+        bedtime, wake_h = self._resolve_window(now)
+
+        # 中断标记只对「本夜」有效：上一夜被吵醒后如果整夜再没来消息（没走到结算），
+        # 标记会一直留着——今晚她再被吵醒就没有激素反应，明早结算还会把昨天那笔
+        # 算到今天头上（quality 与 recall 一起受罚）。
+        if (
+            self.sleep_interrupted_at > 0.0
+            and self._night_key(self.sleep_interrupted_at) != self._night_key(now)
+        ):
+            self.sleep_interrupted_at = 0.0
+
+        # 夜里来消息：睡着（安静够久）才算吵醒；一直聊 / 还没定作息 = 醒着
+        if self._in_window(now, bedtime, wake_h):
+            gap_min = (now - pre_time) / 60.0
+            if not allow_wake or gap_min < cfg.sleep_onset_gap_minutes:
+                return ""
             if self.sleep_interrupted_at == 0.0:
                 self.sleep_interrupted_at = now
                 if self.hormones["oxytocin"] > 70:
@@ -657,61 +767,39 @@ class HormoneSystem:
                 self.fatigue = self._clamp(self.fatigue + 4.0, 0.0, 100.0, 0.0)
             return "night_wake"
 
-        # 跨过今天的起床点后，一次性结算昨晚睡眠（激素↔睡眠双向耦合）
-        wake_ts = self._day_anchor(now, cfg.wake_time)
+        # 跨过起床点后一次性结算昨晚睡眠（激素↔睡眠双向耦合）
+        wake_ts = self._day_anchor(now, wake_h)
         if self._last_sleep_settle < wake_ts:
             self._last_sleep_settle = now
-            slept = self._sleep_overlap_hours(pre_time, now, cfg)
-            was_interrupted = self.sleep_interrupted_at > 0.0
-            self.sleep_interrupted_at = 0.0
-            # 只有确实睡过（或有被吵醒记录）才耦合结算，避免首启/白天误判
-            if slept >= 0.5 or was_interrupted:
-                self._settle_last_sleep(pre_snap, slept, was_interrupted, now)
+            span_h = (wake_h - bedtime) % 24.0 or 8.0
+            bed_ts = wake_ts - span_h * 3600.0
+            if now - pre_time > 36.0 * 3600.0 or not self._state_loaded:
+                # 离线太久 / 首启无历史：没有可靠睡眠信息，只清中断标记、不结算
+                self.sleep_interrupted_at = 0.0
+            else:
+                slept = self._quiet_slept(pre_time, now, bedtime, wake_h)
+                was_interrupted = self.sleep_interrupted_at > 0.0
+                self.sleep_interrupted_at = 0.0
+                # 通宵（整夜在聊、slept≈0）也要结算：当夜有过互动即算
+                if slept >= 0.5 or was_interrupted or pre_time >= bed_ts:
+                    self._settle_last_sleep(pre_snap, slept, was_interrupted, now)
 
         # 刚睡醒的迷糊期
-        if hour >= cfg.wake_time and hour - cfg.wake_time < cfg.groggy_hours:
+        if hour >= wake_h and hour - wake_h < cfg.groggy_hours:
             return "woken"
-        if hour < cfg.wake_time and (hour + 24.0) - cfg.wake_time < cfg.groggy_hours:
+        if hour < wake_h and (hour + 24.0) - wake_h < cfg.groggy_hours:
             return "woken"
 
-        # 睡前犯困期（支持跨午夜，如 bedtime=0.5）
-        start = cfg.bedtime - cfg.wind_down_hours
+        # 睡前犯困期（支持跨午夜）
+        start = bedtime - cfg.wind_down_hours
         if start < 0.0:
-            if hour >= start + 24.0 or hour < cfg.bedtime:
+            if hour >= start + 24.0 or hour < bedtime:
                 return "wind_down"
-        elif start <= hour < cfg.bedtime:
+        elif start <= hour < bedtime:
             return "wind_down"
-
         return ""
 
     # ---------- 睡眠↔激素耦合结算辅助 ----------
-    def _night_window(self, ref_ts: float, cfg) -> tuple[float, float]:
-        """ref_ts 所在夜「就寝→起床」窗口的起止时间戳（支持跨午夜）。"""
-        ws = self._day_anchor(ref_ts, cfg.bedtime)
-        we = self._day_anchor(ref_ts, cfg.wake_time)
-        if we <= ws:
-            we += 24.0 * 3600.0
-        return ws, we
-
-    def _sleep_overlap_hours(self, start: float, end: float, cfg) -> float:
-        """[start, end] 与历晚睡眠窗口重叠的总小时数（跨多天逐日求交）。"""
-        if abs(cfg.bedtime - cfg.wake_time) < 1e-6 or end <= start:
-            return 0.0
-        day = 24.0 * 3600.0
-        seen: set[float] = set()
-        total = 0.0
-        ref = start - 2.0 * day
-        while ref <= end:
-            ws, we = self._night_window(ref, cfg)
-            if ws not in seen:
-                seen.add(ws)
-                lo = max(ws, start)
-                hi = min(we, end)
-                if hi > lo:
-                    total += (hi - lo) / 3600.0
-            ref += day
-        return total
-
     def _score_sleep(
         self, pre_snap: dict, slept: float, was_interrupted: bool
     ) -> tuple[int, str, str, float, float, float]:
@@ -777,6 +865,7 @@ class HormoneSystem:
         self.sleep_thoughts = thought
         self.last_sleep_time = now
         before_fatigue = self.fatigue
+        debt_before = self.sleep_debt
 
         if quality == "bad":
             self._bump("cortisol", 15.0 + length_cort)
@@ -819,39 +908,362 @@ class HormoneSystem:
             self.wake_up_reason = ""
             self.sleep_thoughts = ""
 
+        # 睡眠债：分类 + 累积/自然消退 + 睡懵（夜间激素惩罚已由 quality 管线承担，不重复叠加）
+        cfg_sleep = self._cfg.sleep
+        target = float(cfg_sleep.target_sleep_hours)
+        if cfg_sleep.sleep_debt_enabled:
+            if slept < 1.0:
+                kind = "allnighter"
+            elif slept < target - 1.0:
+                kind = "short"
+            elif slept > target + float(cfg_sleep.oversleep_margin_hours):
+                kind = "oversleep"
+            elif slept > target + 1.5 and debt_before > 0:
+                kind = "catchup"
+            else:
+                kind = "normal"
+            self.last_sleep_kind = kind
+            deficit = max(0.0, target - slept)
+            repay = min(self.sleep_debt, max(0.0, slept - target) * 0.7)
+            self.sleep_debt = max(
+                0.0,
+                min(
+                    float(cfg_sleep.sleep_debt_cap_hours),
+                    self.sleep_debt + deficit - repay - float(cfg_sleep.debt_decay_per_night),
+                ),
+            )
+            if kind == "oversleep":
+                self._bump("dopamine", -4.0)  # 睡懵：昏沉
+                self.fatigue = self._clamp(self.fatigue + 2.0, 0.0, 100.0, 0.0)
+        else:
+            self.last_sleep_kind = "normal"
+            self.sleep_debt = 0.0
+
+        if self.last_sleep_kind == "allnighter":
+            self.pending_dream = None  # 通宵不算有梦
+        else:
+            recall, worth = self._judge_pending_dream(slept, was_interrupted)
+            self._promote_pending_dream(recall, worth)
+
+        q_cn = {"good": "良好", "short": "偏短", "bad": "没睡好"}.get(quality, quality)
         logger.info(
-            f"[Sleep] {slept:.1f}h 结算 | 质量={quality} 分数={score} "
-            f"吵醒={was_interrupted} | 疲劳 {before_fatigue:.0f}→{self.fatigue:.0f}"
+            f"[Sleep] 睡了 {slept:.1f}h｜质量{q_cn}（{score}）｜"
+            f"被吵醒={'是' if was_interrupted else '否'}｜{self.sleep_state_summary()}｜"
+            f"疲劳 {before_fatigue:.0f}→{self.fatigue:.0f}"
+        )
+
+    @staticmethod
+    def _fmt_hour(hour: float) -> str:
+        """把 0–24 小时浮点格式化成 HH:MM。"""
+        minutes = int(round(float(hour) * 60)) % (24 * 60)
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+    def sleep_state_summary(self) -> str:
+        """一行人话版睡眠状态（日志用）。"""
+        cfg = self._cfg.sleep
+        plan = self.sleep_plan if isinstance(self.sleep_plan, dict) else None
+        src_cn = {"model": "她自己定的", "fallback": "兜底公式定的", "config": "固定作息"}
+        if plan:
+            try:
+                plan_s = (
+                    f"今晚 {self._fmt_hour(float(plan.get('bedtime', 0.0)))} 睡 → "
+                    f"{self._fmt_hour(float(plan.get('wake', 0.0)))} 醒"
+                    f"（{float(plan.get('dur_h', 0.0)):.1f}h，"
+                    f"{src_cn.get(str(plan.get('source', '')), '计划')}）"
+                )
+            except (TypeError, ValueError):
+                plan_s = "作息计划异常"
+        elif cfg.dynamic_schedule:
+            plan_s = "今晚还没定作息"
+        else:
+            plan_s = f"固定作息 {self._fmt_hour(cfg.bedtime)}–{self._fmt_hour(cfg.wake_time)}"
+
+        kind_cn = {
+            "allnighter": "通宵", "short": "短睡", "normal": "正常",
+            "catchup": "补觉", "oversleep": "睡过头",
+        }.get(self.last_sleep_kind, "")
+        debt_s = f"睡眠债 {self.sleep_debt:.1f}h" + (f"（{kind_cn}）" if kind_cn else "")
+
+        nap = self.nap if isinstance(self.nap, dict) else None
+        if nap:
+            try:
+                dt = datetime.fromtimestamp(float(nap.get("wake_ts", 0.0)), self._tz())
+                nap_s = f"正在补觉到 {dt.strftime('%H:%M')}"
+            except (TypeError, ValueError, OSError):
+                nap_s = "正在补觉"
+        else:
+            nap_s = "没在补觉"
+
+        pd = self.pending_dream
+        pd_age_h = 1e9
+        if isinstance(pd, dict):
+            try:
+                pd_age_h = (time.time() - float(pd.get("gen_ts", 0.0))) / 3600.0
+            except (TypeError, ValueError):
+                pd_age_h = 1e9
+        if isinstance(pd, dict) and pd_age_h <= 24.0:
+            dream_s = "有梦待晨间确认"
+        elif isinstance(pd, dict):
+            dream_s = "昨晚的梦没等到确认，已经散了"  # 草稿过期（>24h）不会再转正
+        elif isinstance(self.gen_dream, dict):
+            dream_s = "记着昨晚的梦"
+        else:
+            dream_s = "没有梦记录"
+
+        q_cn = {"good": "良好", "short": "偏短", "bad": "没睡好"}.get(self.sleep_quality, self.sleep_quality)
+        return "｜".join([plan_s, debt_s, nap_s, dream_s, f"睡眠质量{q_cn}（{self.sleep_score}）"])
+
+    def _apply_debt_bounds(self) -> None:
+        """睡眠债未还清时：抬高皮质醇底线、压低血清素上限（随债下降自动收窄）。"""
+        cfg = self._cfg.sleep
+        if not cfg.sleep_debt_enabled or self.sleep_debt <= 0.0:
+            return
+        floor = 50.0 + self.sleep_debt * 0.8
+        self.hormones["cortisol"] = max(
+            self.hormones["cortisol"], min(100.0, floor)
+        )
+        ceil = 100.0 - self.sleep_debt * 0.6
+        self.hormones["serotonin"] = min(
+            self.hormones["serotonin"], max(0.0, ceil)
         )
 
     def current_sleep_phase(self, now: float | None = None) -> str:
-        """纯时间判定当前相位，供 prompt 每轮（含无消息回合）取用。
-
-        返回 'sleeping' / 'groggy' / 'wind_down' / ''（不改动任何数值）。
-        """
+        """纯时间判定当前相位（读 plan/config），供 prompt 每轮（含无消息回合）取用。"""
         cfg = self._cfg.sleep
-        if not cfg.enabled or abs(cfg.bedtime - cfg.wake_time) < 1e-6:
+        if not cfg.enabled:
             return ""
         now = now if now is not None else time.time()
+        plan = self._resolve_plan(now)
+        if cfg.dynamic_schedule and plan is None:
+            return ""  # 今晚还没定作息
+        bedtime, wake_h = self._resolve_window(now)
+        if abs(bedtime - wake_h) < 1e-6:
+            return ""
         hour = self._hours_since_midnight(now)
-        if self._in_sleep_window(hour):
+        if self._in_window(now, bedtime, wake_h):
             return "sleeping"
-        if hour >= cfg.wake_time and hour - cfg.wake_time < cfg.groggy_hours:
+        if hour >= wake_h and hour - wake_h < cfg.groggy_hours:
             return "groggy"
-        if hour < cfg.wake_time and (hour + 24.0) - cfg.wake_time < cfg.groggy_hours:
+        if hour < wake_h and (hour + 24.0) - wake_h < cfg.groggy_hours:
             return "groggy"
-        start = cfg.bedtime - cfg.wind_down_hours
+        start = bedtime - cfg.wind_down_hours
         if start < 0.0:
-            if hour >= start + 24.0 or hour < cfg.bedtime:
+            if hour >= start + 24.0 or hour < bedtime:
                 return "wind_down"
-        elif start <= hour < cfg.bedtime:
+        elif start <= hour < bedtime:
             return "wind_down"
         return ""
+
+    def should_plan_sleep(self, now: float | None = None) -> bool:
+        """是否该给今晚定作息：开了自定、已过 plan_at、今夜还没有 plan。"""
+        cfg = self._cfg.sleep
+        if not cfg.dynamic_schedule:
+            return False
+        now = now if now is not None else time.time()
+        if self._hours_since_midnight(now) < float(cfg.plan_at):
+            return False
+        return self._resolve_plan(now) is None
+
+    def apply_sleep_plan(
+        self,
+        bedtime: float,
+        duration_h: float,
+        source: str = "model",
+        note: str = "",
+        now: float | None = None,
+    ) -> dict:
+        """校验/夹取后落地今晚作息；bedtime 支持 >24 表示跨午夜。"""
+        cfg = self._cfg.sleep
+        now = now if now is not None else time.time()
+        earliest = float(cfg.earliest_bedtime)
+        latest = float(cfg.latest_bedtime)
+        raw = float(bedtime) % 24.0
+        b_abs = raw + 24.0 if raw < 12.0 else raw
+        b_abs = max(earliest, min(latest, b_abs))
+        now_hour = self._hours_since_midnight(now)
+        if now_hour >= earliest and b_abs < now_hour:
+            b_abs = min(latest, now_hour + 0.25)
+        dur = max(
+            float(cfg.plan_sane_min_hours),
+            min(float(cfg.plan_sane_max_hours), float(duration_h)),
+        )
+        wake = (b_abs + dur) % 24.0
+        plan = {
+            "night_key": self._night_key(now),
+            "bedtime": round(b_abs % 24.0, 3),
+            "dur_h": round(dur, 2),
+            "wake": round(wake, 3),
+            "decided_at": now,
+            "source": source,
+            "note": note,
+        }
+        self.sleep_plan = plan
+        src_cn = {"model": "她自己定的", "fallback": "兜底公式定的", "config": "固定作息"}
+        logger.info(
+            f"[Plan] 今晚 {self._fmt_hour(plan['bedtime'])} 睡 {dur:.1f}h "
+            f"→ {self._fmt_hour(wake)} 醒（{src_cn.get(source, source)}）"
+        )
+        return plan
+
+    def _today_key(self, now: float) -> str:
+        """本地日期字符串（用于每日补觉次数限制）。"""
+        return datetime.fromtimestamp(now, self._tz()).date().isoformat()
+
+    def should_nap(self, now: float | None = None) -> bool:
+        """是否该考虑补觉：白天、安静够、疲劳/债超阈、今天还没补、且不侵占夜睡。"""
+        cfg = self._cfg.sleep
+        if not cfg.nap_enabled or self.nap is not None or cfg.nap_per_day <= 0:
+            return False
+        now = now if now is not None else time.time()
+        if self.nap_date == self._today_key(now):
+            return False
+        if now - self.nap_check_ts < float(cfg.nap_recheck_minutes) * 60.0:
+            return False
+        bedtime, wake = self._resolve_window(now)
+        if self._in_window(now, bedtime, wake):
+            return False
+        if (now - self.last_interaction_time) / 60.0 < float(cfg.nap_quiet_minutes):
+            return False
+        if (
+            self.fatigue < float(cfg.nap_fatigue_threshold)
+            and self.sleep_debt < float(cfg.nap_debt_threshold)
+        ):
+            return False
+        hour = self._hours_since_midnight(now)
+        b_abs = bedtime if bedtime > hour else bedtime + 24.0
+        if hour + float(cfg.nap_max_hours) > b_abs:
+            return False  # 会侵占夜睡
+        return True
+
+    def start_nap(
+        self, duration_h: float, source: str = "model", now: float | None = None
+    ) -> dict:
+        """落地一次补觉 session（时长夹取到 [nap_min, nap_max]）。"""
+        cfg = self._cfg.sleep
+        now = now if now is not None else time.time()
+        dur = max(
+            float(cfg.nap_min_hours),
+            min(float(cfg.nap_max_hours), float(duration_h)),
+        )
+        self.nap = {
+            "start_ts": now,
+            "wake_ts": now + dur * 3600.0,
+            "dur_h": dur,
+            "source": source,
+        }
+        self.nap_date = self._today_key(now)
+        logger.info(f"[Nap] 去补觉 {dur:.1f}h（{source}）")
+        return self.nap
+
+    def _finalize_nap(self, now: float) -> None:
+        """结束补觉：按实际已睡时长打折回补睡眠债、缓解疲劳。"""
+        nap = self.nap
+        if not isinstance(nap, dict):
+            return
+        start = float(nap.get("start_ts", now))
+        planned = float(nap.get("dur_h", 0.0))
+        actual = max(0.0, min(planned, (now - start) / 3600.0))
+        if actual > 0.0:
+            self.sleep_debt = max(
+                0.0,
+                self.sleep_debt - actual * float(self._cfg.sleep.nap_repay_factor),
+            )
+            self.fatigue = self._clamp(self.fatigue - actual * 8.0, 0.0, 100.0, 0.0)
+        logger.info(
+            f"[Nap] 醒 {actual:.1f}h | 债={self.sleep_debt:.1f}h 疲劳={self.fatigue:.0f}"
+        )
+        self.nap = None
+
+    def set_pending_dream(self, dream_text: str, tone: str) -> None:
+        """熟睡中段生成梦时先存草稿（内容+基调）；醒来再判定 recall/worth。"""
+        self.pending_dream = {
+            "text": dream_text,
+            "tone": tone,
+            "gen_ts": time.time(),
+        }
+        self.recent_turns = []
+
+    def drop_expired_pending(self, now: float | None = None) -> bool:
+        """丢掉超过 24h 还没等到结算的草稿（返回是否真的丢了）。
+
+        草稿的过期原本只在结算那一刻判——若那个会话之后再没人说话、永远不结算，
+        草稿就会一直躺在 state 里（[State] 里看着像"有梦待确认"）。后台任务每轮
+        调一次这里，把死草稿清掉，状态文件才和事实一致。
+        """
+        pd = self.pending_dream
+        if not isinstance(pd, dict):
+            return False
+        now = time.time() if now is None else now
+        try:
+            age = now - float(pd.get("gen_ts", 0.0))
+        except (TypeError, ValueError):
+            age = 1e9
+        if age <= 24.0 * 3600.0:
+            return False
+        self.pending_dream = None
+        return True
+
+    def _judge_pending_dream(
+        self, slept: float, was_interrupted: bool
+    ) -> tuple[str, bool]:
+        """醒来确定性判定记得多清楚、值不值得记（方案 A）。"""
+        pd = self.pending_dream
+        if not isinstance(pd, dict):
+            return "none", False
+        target = float(self._cfg.sleep.target_sleep_hours)
+        if slept < 2.0:
+            recall = "none"
+        elif was_interrupted or slept < target:
+            recall = "fuzzy"
+        else:
+            recall = "clear"
+        tone = str(pd.get("tone", "neutral"))
+        worth = recall != "none" and (
+            recall == "clear" or tone in ("sweet", "ambivalent")
+        )
+        return recall, worth
+
+    def _promote_pending_dream(self, recall: str, worth: bool) -> None:
+        """醒来判定后把草稿转正进 gen_dream / 小本本（worth 才记）。"""
+        pd = self.pending_dream
+        self.pending_dream = None
+        if not isinstance(pd, dict) or not pd.get("text"):
+            return
+        try:
+            if time.time() - float(pd.get("gen_ts", 0.0)) > 24.0 * 3600.0:
+                return  # 太久的草稿丢弃，避免隔夜误转正
+        except (TypeError, ValueError):
+            return
+        self.gen_dream = dict(pd)
+        self.gen_dream["recall"] = recall
+        self.gen_dream["worth"] = bool(worth)
+        try:
+            self.gen_dream["ts"] = float(pd.get("gen_ts", time.time()))
+        except (TypeError, ValueError):
+            self.gen_dream["ts"] = time.time()
+        if worth:
+            now = time.time()
+            self.sleep_journal.append(
+                {
+                    "date": self._today_key(now),
+                    "text": pd["text"],
+                    "tone": pd.get("tone", "neutral"),
+                    "recall": recall,
+                    "salience": round(self._compute_smoothed_aff(), 3),
+                    "quality": self.sleep_quality,
+                }
+            )
+            limit = self._cfg.sleep.journal_max_days
+            if len(self.sleep_journal) > limit:
+                self.sleep_journal = self.sleep_journal[-limit:]
 
     # ---------- 睡眠记忆整理 / 梦生成辅助 ----------
     def _push_recent_turn(self, text: str, score: float) -> None:
         """把本轮用户消息截断后压入 recent_turns（仅 consolidate 开启时被调用）。"""
-        clip = text if len(text) <= 80 else text[:80]
+        if not text or not text.strip():
+            return  # 只有引用壳/空内容的消息不该占一条原料
+        limit = int(getattr(self._cfg.sleep, "turn_clip_chars", 120))
+        clip = text if len(text) <= limit else text[:limit] + "…"
         self.recent_turns.append(
             {
                 "text": clip,
@@ -1025,6 +1437,13 @@ class HormoneSystem:
             "recent_turns": [dict(t) for t in self.recent_turns],
             "sleep_journal": [dict(j) for j in self.sleep_journal],
             "gen_dream": dict(self.gen_dream) if self.gen_dream else None,
+            "sleep_debt": float(self.sleep_debt),
+            "last_sleep_kind": str(self.last_sleep_kind),
+            "sleep_plan": dict(self.sleep_plan) if self.sleep_plan else None,
+            "nap": dict(self.nap) if self.nap else None,
+            "nap_date": str(self.nap_date),
+            "nap_check_ts": float(self.nap_check_ts),
+            "pending_dream": dict(self.pending_dream) if self.pending_dream else None,
             "version": version,
         }
 
@@ -1136,3 +1555,53 @@ class HormoneSystem:
         raw_gd = data.get("gen_dream")
         if isinstance(raw_gd, dict) and "text" in raw_gd:
             self.gen_dream = raw_gd
+
+        raw_debt = data.get("sleep_debt")
+        if isinstance(raw_debt, (int, float)) and not isinstance(raw_debt, bool):
+            cap = self._cfg.sleep.sleep_debt_cap_hours
+            self.sleep_debt = max(0.0, min(float(cap), float(raw_debt)))
+        kind = data.get("last_sleep_kind")
+        if isinstance(kind, str):
+            self.last_sleep_kind = kind
+
+        raw_plan = data.get("sleep_plan")
+        if isinstance(raw_plan, dict) and raw_plan.get("night_key"):
+            try:
+                self.sleep_plan = {
+                    "night_key": str(raw_plan["night_key"]),
+                    "bedtime": float(raw_plan["bedtime"]) % 24.0,
+                    "dur_h": float(raw_plan.get("dur_h", 6.0)),
+                    "wake": float(raw_plan["wake"]) % 24.0,
+                    "decided_at": float(raw_plan.get("decided_at", 0.0)),
+                    "source": str(raw_plan.get("source", "")),
+                    "note": str(raw_plan.get("note", "")),
+                }
+            except (KeyError, TypeError, ValueError):
+                self.sleep_plan = None
+
+        raw_nap = data.get("nap")
+        if isinstance(raw_nap, dict) and "wake_ts" in raw_nap:
+            try:
+                self.nap = {
+                    "start_ts": float(raw_nap.get("start_ts", time.time())),
+                    "wake_ts": float(raw_nap["wake_ts"]),
+                    "dur_h": float(raw_nap.get("dur_h", 0.0)),
+                    "source": str(raw_nap.get("source", "")),
+                }
+            except (TypeError, ValueError):
+                self.nap = None
+        nd = data.get("nap_date")
+        if isinstance(nd, str):
+            self.nap_date = nd
+        nct = data.get("nap_check_ts")
+        if (
+            isinstance(nct, (int, float))
+            and not isinstance(nct, bool)
+            and nct >= 0
+        ):
+            self.nap_check_ts = float(nct)
+
+        self._state_loaded = True
+        raw_pd = data.get("pending_dream")
+        if isinstance(raw_pd, dict) and raw_pd.get("text"):
+            self.pending_dream = raw_pd
