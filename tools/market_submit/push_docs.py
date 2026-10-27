@@ -144,8 +144,14 @@ def main():
 
     if args.apply:
         md = locals_["README.md"].decode("utf-8")
-        st, res = call("PUT", f"{MARKET}/api/v1/plugins/hormone_system", token,
-                       {"readme_markdown": md}, accept="application/json")
+        # 坑：PUT 只传 readme_markdown 会让服务端 500，必须带完整字段（先读回当前记录再合并）
+        st, cur = call("GET", f"{MARKET}/api/v1/plugins/{'hormone_system'}", token, accept="application/json")
+        cur = cur if isinstance(cur, dict) else {}
+        body = {k: cur.get(k) for k in ("display_name", "summary", "description", "homepage",
+                                        "repository_url", "license", "categories", "tags", "maintainers")}
+        body["plugin_dependencies"] = cur.get("plugin_dependencies") or ["kokoro_flow_chatter"]
+        body["readme_markdown"] = md
+        st, res = call("PUT", f"{MARKET}/api/v1/plugins/hormone_system", token, body, accept="application/json")
         ok = isinstance(res, dict) and res.get("plugin_id", "hormone_system") == "hormone_system"
         print("market readme ->", st, "已刷新" if ok else json.dumps(res, ensure_ascii=False)[:300])
         st, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
