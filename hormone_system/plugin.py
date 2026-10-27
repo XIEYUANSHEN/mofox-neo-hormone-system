@@ -760,6 +760,104 @@ class DreamReviewCommand(BaseCommand):
         return "\n".join(parts)
 
 
+class SleepStatusCommand(BaseCommand):
+    """/睡眠状态：只读展示今晚作息、睡眠债、补觉与梦境概况（不泄露聊天原文）。"""
+
+    name: str = "睡眠状态"
+    description: str = "查看她今晚的作息/睡眠债/补觉/梦境概况（只读）"
+
+    @cmd_route()
+    async def handle_status(self) -> tuple[bool, str]:
+        """读取当前 stream 的状态，拼一段人话概览。"""
+        try:
+            plug = getattr(self, "plugin", None)
+            cfg = getattr(plug, "config", None) if plug else None
+            if not isinstance(cfg, HormoneSystemConfig):
+                cfg = HormoneSystemConfig()
+            store = HormoneStateStore(cfg.core.state_dir)
+            sid = str(getattr(self, "stream_id", "") or "")
+            data = store.load(sid)
+            if not data:
+                return True, "（还没有她的作息记录——今晚 21:30 之后会自动定）"
+            system = HormoneSystem(cfg)
+            system.apply_state(data)
+            return True, self._format_status(system, cfg, time.time())
+        except Exception as exc:  # noqa: BLE001 - 只读命令不能抛错
+            logger.warning(f"查看睡眠状态失败: {exc}")
+            return True, "（状态一时没读出来，晚点再看）"
+
+    @staticmethod
+    def _format_status(
+        system: HormoneSystem, config: HormoneSystemConfig, now: float
+    ) -> str:
+        """把 plan / 相位 / 债 / 补觉 / 梦 / 梦料 拼成几行人话（只说数量，不贴原文）。"""
+        fmt = HormoneSystem._fmt_hour
+        src_cn = {"model": "她自己定的", "fallback": "兜底公式定的", "config": "固定作息"}
+        plan = system._resolve_plan(now)
+        if isinstance(plan, dict):
+            try:
+                head = (f"今晚 {fmt(float(plan['bedtime']))} 睡 → "
+                        f"{fmt(float(plan['wake']))} 醒（{float(plan['dur_h']):.1f}h，"
+                        f"{src_cn.get(str(plan.get('source')), '自己定的')}）")
+            except (KeyError, TypeError, ValueError):
+                head = "今晚的作息记录有点不完整"
+        else:
+            head = "今晚还没定作息（默认 21:30 之后她自己定）"
+
+        phase = system.current_sleep_phase(now)
+        phase_cn = {"wind_down": "犯困收尾", "sleeping": "睡下了", "groggy": "刚睡醒"}.get(phase, "醒着")
+
+        debt = float(getattr(system, "sleep_debt", 0.0) or 0.0)
+        streak = int(getattr(system, "sleep_short_streak", 0) or 0)
+        kind_cn = {"allnighter": "通宵", "short": "短睡", "normal": "正常",
+                   "catchup": "补觉后", "oversleep": "睡多了"}.get(
+                       str(getattr(system, "last_sleep_kind", "")), "")
+        debt_s = f"睡眠债 {debt:.1f}h"
+        if kind_cn:
+            debt_s += f"（最近一晚：{kind_cn}"
+            debt_s += f"，连续短睡 {streak} 晚）" if streak >= 2 else "）"
+
+        nap = getattr(system, "nap", None)
+        if isinstance(nap, dict):
+            try:
+                nap_s = f"正在补觉到 {fmt(system._hours_since_midnight(float(nap['wake_ts'])))}"
+            except (KeyError, TypeError, ValueError, OSError):
+                nap_s = "正在补觉"
+        else:
+            nap_s = "没在补觉"
+
+        pd = getattr(system, "pending_dream", None)
+        gd = getattr(system, "gen_dream", None)
+        if isinstance(pd, dict):
+            dream_s = "熟睡里做过一个梦，等醒来判定记不记得"
+        elif isinstance(gd, dict) and gd.get("text"):
+            dream_s = "记着昨晚的梦"
+        else:
+            dream_s = "暂时没有梦"
+
+        turns = getattr(system, "recent_turns", []) or []
+        mine = sum(1 for t in turns if str(t.get("who", "user")) == "self")
+        mats = f"梦料 {len(turns)} 条（他 {len(turns) - mine} / 我 {mine}）"
+        if turns:
+            try:
+                oldest = min(float(t.get("ts", now)) for t in turns)
+                days = max(0.0, (now - oldest) / 86400.0)
+                mats += f"，覆盖 {days:.1f} 天"
+            except (TypeError, ValueError):
+                pass
+
+        q_cn = {"good": "良好", "short": "偏短", "bad": "没睡好"}.get(
+            str(getattr(system, "sleep_quality", "")), "未知")
+        score = getattr(system, "sleep_score", 0)
+        return chr(10).join([
+            head,
+            f"现在：{phase_cn}｜{debt_s}",
+            f"{nap_s}｜梦：{dream_s}",
+            f"{mats}",
+            f"上一夜质量：{q_cn}（{score}）",
+        ])
+
+
 @register_plugin
 class HormoneSystemPlugin(BasePlugin):
     """赛博内分泌系统插件。"""
@@ -819,7 +917,7 @@ class HormoneSystemPlugin(BasePlugin):
         if isinstance(config, HormoneSystemConfig) and not config.core.enabled:
             logger.info("hormone_system 已在配置中禁用")
             return []
-        return [HormonePromptHandler, HormoneSentHandler, DreamReviewCommand]
+        return [HormonePromptHandler, HormoneSentHandler, DreamReviewCommand, SleepStatusCommand]
 
     async def on_plugin_loaded(self) -> None:
         """加载后：若开启睡眠整理，等待调度器就绪再注册周期任务。"""

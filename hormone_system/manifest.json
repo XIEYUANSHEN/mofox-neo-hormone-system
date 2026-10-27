@@ -1,7 +1,7 @@
 {
     "name": "hormone_system",
     "display_name": "赛博内分泌",
-    "version": "0.4.2",
+    "version": "0.4.3",
     "description": "为 KFC 角色提供情绪惯性、疲劳度、睡眠节律与睡眠记忆整理（小本本/梦）",
     "author": "中生",
     "license": "AGPL-3.0",
@@ -35,6 +35,12 @@
         {
             "component_type": "command",
             "component_name": "查看昨晚梦境",
+            "dependencies": [],
+            "enabled": true
+        },
+        {
+            "component_type": "command",
+            "component_name": "睡眠状态",
             "dependencies": [],
             "enabled": true
         },

@@ -1308,6 +1308,54 @@ _old31.apply_state({"version": 4, "sleep_awake_ts": [
 check("31.6 旧散点字段能迁移成区间（相邻<10分钟合并）",
       len(_old31.sleep_awake_spans) == 2, _old31.sleep_awake_spans)
 
+# ---------- 33. /睡眠状态 概览 ----------
+c33 = cfg_consolidate(True)
+s33 = HormoneSystem(c33)
+_now33 = time.time()
+s33.sleep_plan = {
+    "night_key": s33._night_key(_now33), "bedtime": 23.667, "dur_h": 6.5,
+    "wake": 6.167, "decided_at": _now33, "source": "model", "note": "",
+}
+s33.sleep_debt = 2.5
+s33.last_sleep_kind = "short"
+s33.sleep_short_streak = 2
+s33.sleep_quality = "good"
+s33.sleep_score = 88
+s33.gen_dream = {"text": "梦见他", "tone": "sweet", "recall": "clear",
+                 "worth": True, "ts": _now33}
+s33.recent_turns = [
+    {"text": "中生：在吗", "score": 0.2, "ts": _now33 - 3600, "who": "user"},
+    {"text": "我：在的呀", "score": 0.0, "ts": _now33 - 3500, "who": "self"},
+    {"text": "我：别熬了", "score": 0.0, "ts": _now33 - 3400, "who": "self"},
+]
+_st33 = hp.SleepStatusCommand._format_status(s33, c33, _now33)
+check("33.1 概览含作息/债/梦/梦料",
+      "23:40 睡" in _st33 and "睡眠债 2.5h" in _st33
+      and "记着昨晚的梦" in _st33 and "梦料 3 条（他 1 / 我 2）" in _st33,
+      _st33)
+check("33.2 连续短睡超过两晚才提" , "连续短睡 2 晚" in _st33, _st33)
+s33.sleep_short_streak = 1
+_st33b = hp.SleepStatusCommand._format_status(s33, c33, _now33)
+check("33.3 只有一晚不写连续短睡", "连续短睡" not in _st33b, _st33b)
+
+s33b = HormoneSystem(c33)
+_st33c = hp.SleepStatusCommand._format_status(s33b, c33, _now33)
+check("33.4 没定作息时说清默认时点", "今晚还没定作息" in _st33c and "21:30" in _st33c, _st33c)
+
+# 33.5 命令本体：没有状态文件时给一句人话，不抛错
+async def _cmd33():
+    import tempfile as _tf
+    c = cfg_consolidate(True)
+    c.core.state_dir = _tf.mkdtemp(prefix="status33_")
+    inst = hp.HormoneSystemPlugin.__new__(hp.HormoneSystemPlugin)
+    inst.config = c
+    cmd = hp.SleepStatusCommand.__new__(hp.SleepStatusCommand)
+    cmd.plugin = inst
+    cmd.stream_id = "nope"
+    return await cmd.handle_status()
+_ok33, _txt33 = asyncio.run(_cmd33())
+check("33.5 无状态时不抛错、给一句人话", _ok33 is True and "作息记录" in _txt33, _txt33)
+
 print("\n==== RESULT ====")
 print("FAILED:", fails if fails else "NONE")
 sys.exit(1 if fails else 0)
