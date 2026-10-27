@@ -26,13 +26,14 @@
 1. **她自己定今晚作息**——`plan_at`（默认 21:30）之后，后台问一次模型「今晚几点睡、睡多久」，落 `sleep_plan`；带防呆夹取（就寝 20:00–次日 06:00、时长 1–12h、不能定在过去），问不成就用兜底公式（越累越早睡、睡越久）。`target_sleep_hours`（默认 6h）只是推荐值与缺额基准，不是硬性政策。
 2. **睡前收尾**——就寝前 `wind_down_hours`（默认 **0.5 小时**）开始，注入会告诉她「你有点犯困了，不过今晚是你自己定的 23:40 才睡，还没到点」。**把困意和她自己的约定放在同一句话里**，免得提前半小时就道晚安。
 3. **睡着的判定**——睡眠窗内来消息，只有「距上次互动安静满 `sleep_onset_gap_minutes`（默认 30 分钟）」才算她被吵醒；一直聊 = 她选择继续陪着你，不算吵醒、也不扣睡眠质量。
-4. **熟睡中段生成梦**——落在睡眠窗 30%–70% 之间（`dream_mid_start_ratio` / `dream_mid_end_ratio`），拿白天情绪波动最大的几条当原料，模型只产**梦的内容 + 基调**（甜 / 中性 / 甜虐），先存草稿 `pending_dream`；基调判成噩梦时不产内容，交回「潜意识的阴影」那条老路。
+4. **熟睡中段生成梦**——落在睡眠窗 30%–70% 之间（`dream_mid_start_ratio` / `dream_mid_end_ratio`），原料是下面「梦的素材从哪来」那节攒下的双方发言，模型只产**梦的内容 + 基调**（甜 / 中性 / 甜虐），先存草稿 `pending_dream`；基调判成噩梦时不产内容，交回「潜意识的阴影」那条老路。
 5. **醒来才判定**——第一次互动时结算：`recall`（睡了 <2h → 不记得；被吵醒或没睡够 → 模糊；否则清楚）与 `worth`（清楚，或模糊但基调偏甜/甜虐）都是**确定性规则**，值得记的才转正进 `gen_dream` 和「小本本」（保留 `journal_max_days` 天）。通宵则直接丢弃草稿。
 6. **睡眠结果回写身体**——坏睡升皮质醇、降多巴胺/血清素/内啡肽并带数轮起床气；睡饱把压力拉回基线、补催产素与内啡肽、疲劳清零；睡过头会「睡懵」。
-7. **睡眠债**——每夜按 `target - 实睡` 累积（上限 12h），每夜自然消退 0.8h，补觉回补打 0.5 折；债未清时抬皮质醇底线、压血清素上限。**债不必还清，身体自己有调节**。
-**睡的时长怎么算**：不是「最后一次说话到起床」，而是整夜的累计安静——窗内她醒着的时刻会被记下，两句间隔不到 10 分钟算同一段清醒，超过 10 分钟的静默才算睡着。所以半夜被摸一下头、亲一口，不会把一整夜作废；反过来真聊到快天亮，也真的只剩最后那点安静时间。
+7. **睡眠债**——每夜按 `target - 实睡` 累积（上限 `sleep_debt_cap_hours` 默认 12h），每晚安睡自然消退 `debt_decay_per_night`（0.8h），补觉回补按 `nap_repay_factor`（0.5）折算；债未清时抬皮质醇底线、压血清素上限。**债不必还清，身体自己有调节**。
 
 8. **白天补觉必须是她主动决定**——白天安静满 40 分钟、且疲劳 >60 或睡眠债 >2h、今天还没补过，后台才问模型要不要小睡（0.5–2h）；被拒绝后按 `nap_recheck_minutes`（默认 60 分钟）冷却，不会每轮重问。补觉期间来消息算轻度吵醒。
+
+**睡多久是怎么算出来的**：不是「最后一次说话 → 起床点」，而是整夜的**累计安静**——窗内她醒着的时刻记成区间（`sleep_awake_spans`），相邻不到 10 分钟并成同一段清醒，超过 10 分钟的静默才算又睡着了；起床结算后清空。所以半夜被摸一下头、亲一口不会把整夜作废；反过来真聊到天亮，也真的只剩最后那点安静时间。旧状态文件里的散点字段会自动迁移。
 
 ### 梦的素材从哪来（0.4.2 起）
 
@@ -55,12 +56,13 @@
 
 ## 安装
 
-二选一（同名时**文件夹优先于 .mfp**）：
+三种装法（同名时**文件夹优先于 .mfp**）：
 
-- 把 `hormone_system/` 整个目录放进运行实例的 `plugins/`；
-- 或投放打包好的 `hormone_system-0.4.1.mfp`（8 个文件平铺在压缩包根目录，框架按 archive 安装）。
+- 插件市场：在 Neo-MoFox 的插件管理里搜 `hormone_system`（或访问市场页 <https://39.96.71.162/plugin/hormone_system>），装完仍需重启实例；
+- 把 `hormone_system/` 整个目录放进运行实例的 `plugins/`（源码仓库里就是这个目录）；
+- 或投放打包好的 `hormone_system-0.4.3.mfp`（8 个文件平铺在压缩包根目录，框架按 archive 安装）。
 
-**改完必须重启实例才生效**——插件与配置都在启动时加载。首次加载会按当时的默认值生成 `config/plugins/hormone_system/config.toml`，此后**升级插件里的默认值不会覆盖已生成的配置**，要改就直接改那个 toml。
+**改完必须重启实例才生效**——插件与配置都在启动时加载。首次加载会按当时的默认值生成 `config/plugins/hormone_system/config.toml`，此后**升级插件里的默认值不会覆盖已生成的配置**，要改就直接改那个 toml。卸载：删掉 `plugins/hormone_system*`，她的状态与梦料留在 `data/plugins/hormone_system/<stream>.json`，想连记录一起清就删这个目录。
 
 ## 配置
 
@@ -70,31 +72,47 @@
 [sleep]
 enabled = true                 # 睡眠层总开关（关=只跑激素数值）
 dynamic_schedule = true        # 让她每天自定作息（关=用下面固定 bedtime/wake_time）
+plan_at = 21.5                 # 每晚这个点之后去定今晚作息
 bedtime = 23.5                 # 固定作息的就寝点（兜底也用）
 wake_time = 7.0                # 固定作息的起床点
 wind_down_hours = 0.5          # 睡前多久进入「犯困收尾」语气
 groggy_hours = 1.0             # 起床后多久算「刚睡醒」
 target_sleep_hours = 6.0       # 推荐时长 / 睡眠债缺额基准
 sleep_onset_gap_minutes = 30   # 窗内需安静满多久才算被吵醒（0=旧行为）
+sleep_debt_enabled = true      # 记不记睡眠债
+sleep_debt_cap_hours = 12.0    # 债的上限
+debt_decay_per_night = 0.8     # 睡够一晚自然消掉多少债
+oversleep_margin_hours = 2.5   # 比 target 多睡这么多算「睡懵」
 consolidate = true             # 梦/小本本总开关（关=不注册调度、不调模型）
-dream_mid_start_ratio = 0.3    # 睡眠窗 30% 之后开始生成梦
-dream_mid_end_ratio = 0.7      # 70% 为止
 consolidate_model_task = ""    # 留空 = 从 actor 起走备用任务链
 consolidate_timeout_seconds = 25.0   # 单个任务一次的上限
 consolidate_total_seconds = 60.0     # 整条链的总预算
+dream_mid_start_ratio = 0.3    # 睡眠窗 30% 之后开始生成梦
+dream_mid_end_ratio = 0.7      # 70% 为止
+dream_pre_wake_hours = 1.0     # 已不再使用（0.4.0 起梦改在熟睡中段生成），留着只为兼容旧配置文件
 turn_clip_chars = 120          # 单条入梦原料保留的正文长度（已剥掉转发信封）
+turn_buffer_max = 40           # 旧版的原料条数下限，实际取 max(turn_buffer_max, dream_material_max)
 dream_material_max = 120       # 梦料上限（条，跨天）
 dream_material_days = 2.0      # 梦料只留最近几天
+top_k = 5                      # 一次做梦取几条原料
 dream_context_lines = 1        # 每条素材前后各带几句上下文
 dream_random_picks = 1         # 再随机抓几条，避免每次都同一批
 dream_conflict_quota = 2       # 最近 24h 的强负面必须带几条进梦
 dream_conflict_threshold = -0.45  # 低于此分算冲突
 dream_resolve_threshold = 0.6  # 冲突后有多强的正面才算"消解"
 dream_sweet_needs_resolve = true  # 没消解的冲突 → 压成甜虐，不给纯甜
+journal_max_days = 3           # 小本本（记住的梦）保留几天
 nap_enabled = true             # 允许她白天自己决定补觉
+nap_quiet_minutes = 40         # 白天安静满多久才有资格想补觉
+nap_fatigue_threshold = 60.0   # 或多累
+nap_debt_threshold = 2.0       # 或欠多少觉
+nap_repay_factor = 0.5         # 补觉回补睡眠债的折扣
+nap_recheck_minutes = 60       # 被自己拒绝后多久再问一次
 state_log_minutes = 30.0       # [State] 心跳；状态有变化时立即打
 timezone = "Asia/Shanghai"     # 睡眠判定所用时区（空=服务器本地）
 ```
+
+`nap_min_hours` / `nap_max_hours` / `nap_per_day` / `nap_check_minutes` / `dream_check_minutes` 这些细项也都在生成的 config.toml 里，带各自注释。
 
 想彻底退回旧行为：`[sleep] enabled=false`（整层关掉）、`dynamic_schedule=false`（用固定作息）、`sleep_onset_gap_minutes=0`（窗内即算吵醒）、`sleep_debt_enabled=false`（不记债）、`nap_enabled=false`（不补觉）、`consolidate=false`（不做梦、不注册调度）。其余字段的含义都写在生成到 config.toml 的注释里。
 
@@ -112,6 +130,9 @@ timezone = "Asia/Shanghai"     # 睡眠判定所用时区（空=服务器本地�
 - **多会话各自独立**：每个 stream 有自己的作息、原料、梦。同一个角色在你的私聊里可能 23:30 睡，在另一个会话里 00:10 才睡——这是有意为之（按会话积累）。
 - **群聊会杂**：原料里会带每条消息的昵称，但她那边统一渲染成"他：…"，人多的群会混着入梦。
 - **模型**：做梦/定作息/补觉默认跟随主回复模型（actor），失败会依次退到 `sub_actor → utils_small → utils`；全都不行那晚就不做梦（日志会说明原因），不影响回复。
+- **结算要等她开口**：「醒来」是挂在第一次真实互动上判定的。她 07:00 就该起了，但你 11:00 才发消息，`[Sleep]` 那行结算日志就出现在 11:00——**时长仍按计划起床点算**（封顶在起床点，多睡的那几个小时不会记成她的睡眠），也不会因为你晚发消息把她算成多睡了四小时；只是起床气按墙钟走，到那时候她已经过了「刚睡醒迷糊」那段，不会补给你一次。
+- **清醒并段的 10 分钟是内置的**：`sleep_awake_spans` 里相邻区间相差不到 10 分钟就并成一段清醒，这个阈值目前不是配置项。
+- **状态文件里的 `version` 只是个标记**：写盘时按 `[core] state_version` 盖上；**读盘不看它**——逐字段宽容解析，缺 `who`/`clipped` 就补成「他说的 / 没截断」，缺 `sleep_awake_spans` 就退回旧的「上次互动 → 起床点」口径。所以老环境里留着 `state_version = 1` 不会让功能坏掉，只是排查时容易把人误导成「这文件还是旧格式所以没生效」；想对齐就把它改成 4。
 - **时区**：默认 `Asia/Shanghai`，改 `[sleep] timezone`；服务器缺 tzdata 时会退回本地时区。
 
 ## 三套常见配置
@@ -129,45 +150,59 @@ consolidate = false          # 连梦和小本本一起关；只想关梦不关�
 **B. 自定作息 + 晚睡党（默认，建议先这么跑一晚看看）**
 
 ```toml
+[sleep]
 dynamic_schedule = true
 plan_at = 21.5
 target_sleep_hours = 6.0
 nap_enabled = true
 ```
 
-**C. 只做梦，不记账（不要睡眠债、不想影响激素基线）**
+**C. 只做梦，不记账（不要睡眠债、不想让它压激素底线）**
 
 ```toml
-sleep_debt_enabled = false
-sleep_onset_gap_minutes = 0   # 窗内来消息即算吵醒（旧行为）
+[sleep]
+sleep_debt_enabled = false   # 不再累积欠觉，也就不再抬皮质醇底线 / 压血清素上限
+consolidate = true           # 梦和小本本照常
 ```
+
+想连「吵醒判定」一起退回旧行为（窗内一来消息就算被吵醒），另加 `sleep_onset_gap_minutes = 0`。
 
 ## 自检 / 测试
 
-插件不依赖网络也能测：`test_hormone_v030.py`（187 条断言，含配置默认值、睡着判定、债的分类、梦窗、状态往返、模型任务兜底链、日志节流、原料剥壳与注入预算、梦料分层与冲突配额、她的话入料）与 `test_sim_v04_e2e.py`（整夜 mock 端到端）都在实例根目录下跑：
+两个测试脚本**不联网、不调模型、不写你的实例数据**，只想确认"这版在我这套框架上没跑歪"的话可以直接跑：
+
+- `test_hormone_v030.py` — 187 条断言（配置默认值、睡着判定、睡眠债分类、梦窗、状态往返、模型任务兜底链、日志节流、原料剥壳与注入预算、梦料分层与冲突配额、她的话入料、`/睡眠状态` 渲染）；
+- `test_sim_v04_e2e.py` — 11 条整夜 mock 端到端（定作息 → 睡前聊不算吵醒 → 熟睡中段做梦 → 醒来结算转正 → 通宵记债丢梦 → 白天主动补觉被吵醒）。
+
+脚本在**仓库根目录**，`.mfp` 包里没有（包里只有 8 个运行时文件），从市场装的先 `git clone` 仓库再跑：
 
 ```bash
-# 脚本跟着仓库走；cwd 指向实例根目录（或用 MOFOX_HOME 指定）
-cd <实例目录> && .venv/bin/python <仓库>/test_hormone_v030.py
+# 脚本靠 cwd 找 plugins/ 与 src/，所以要站在实例根目录跑（或 export MOFOX_HOME=<实例目录>）
+cd <实例目录>
+.venv/bin/python <仓库>/test_hormone_v030.py      # Windows：.venv\Scripts\python.exe
+.venv/bin/python <仓库>/test_sim_v04_e2e.py
 ```
 
-真模型连通性另有一测：把 `get_model_set_by_task("actor")` 故意弄成不可用，验证梦仍能从备用任务里出来。注意 headless 跑要先 `init_model_config("config/model.toml")`，否则一切调用都会走兜底，容易误判成代码坏了。
+打印 `FAILED: NONE` 就是全绿，退出码 0/1 方便挂 CI。整套十几秒，state 一律写在系统临时目录的 `hormone_*` 里，不动 `plugins/hormone_system/` 下的任何东西；所有模型调用都被 monkeypatch 成假响应，**不扣 token、不需要网络**。也就是说它验的是逻辑，不是连通性。
+
+连通性得单独验（场景：主回复模型欠费/限流，梦还要做得出来）。思路是照候选链打一刀：让 `get_model_set_by_task("actor")` 抛异常，然后跑一夜，日志里应出现 `[Model] hormone_dream 换用备用模型任务 sub_actor（前面 actor 没成）`＋一条 `[DreamPend]`。这种要在真实例上跑，且 headless 先 `init_model_config("config/model.toml")`——不初始化模型配置时所有调用都会直接走兜底，容易把"没配模型"误判成"代码坏了"。
 
 三条容易踩的：
 
-- 跑之前 `cd <实例目录>`（或设 `MOFOX_HOME`）——脚本靠 cwd 找 `plugins/` 和 `src/`，在别处跑会一路报模块找不到；
-- **测试文件别放进 `plugins/`**，否则会被当成插件内容一起打包；
-- 整套测试只读状态、不写你的数据，但最后那段会真调一次模型（链路连通性），介意的话把那段删掉再跑。
+- 忘了 `cd <实例目录>`（或设 `MOFOX_HOME`）→ 一路 ModuleNotFoundError，看着像插件坏了；
+- **别把测试文件拷进 `plugins/hormone_system/`**，那会被当成插件内容一起打包（我们踩过，0.4.2 的头一个包里就多塞了一个）；
+- 测试内部用固定时钟（2026-10-2x 那几天）断言，你在任何日子跑结果都一样；反过来，别拿它当"她今晚会不会做梦"的实时诊断，那用 `/睡眠状态` 看更直接。
 
 ## 依赖
 
-- 框架：Neo-MoFox **1.3.0-alpha.0**（`stream_api` 2.0 / `event_api` 1.0），Python 3.11；`manifest.json` 声明依赖 `kokoro_flow_chatter`（KFC），`min_core_version = 1.3.0-alpha.0`。
-- 纯标准库，无第三方依赖；模型调用只走框架 `llm_api`。
+- 框架：Neo-MoFox **1.3.0-alpha.0**（`stream_api` 2.0 / `event_api` 1.0），`manifest.json` 声明依赖 `kokoro_flow_chatter`（KFC），`min_core_version = 1.3.0-alpha.0`（市场收录的兼容下限与此一致）。
+- **Python 3.11**（我们只在 3.11 上实测过；代码只用标准库，含 `zoneinfo`）。纯标准库，无第三方依赖；模型调用只走框架 `llm_api`。
 - 打分与整理默认跟随角色对话模型，可在 `[score] model_task` / `[sleep] consolidate_model_task` 指定独立任务。
 
 ## 版本
 
-- **0.4.2**：重做梦的素材机制——双方发言都入料、跨两天、多时间层分层抽样＋随机、片段化并打乱顺序、冲突强制配额与基调下限（吵架没被哄好就不给纯甜梦）；顺带容忍被截断的模型输出；睡眠时长改按整夜累计安静（半夜被吵醒不再把整夜算成没睡）；内部提示不再当他说的话；新增 `/睡眠状态` 只读概览。
+- **0.4.3**：新增只读命令 `/睡眠状态`（作息/相位/债/补觉/梦/梦料条数，只报数量与状态、不贴聊天原文）；README 补「已知边界与隐私」「三套常见配置」与上面这节自检说明。运行逻辑与 0.4.2 相同。
+- **0.4.2**：重做梦的素材机制——双方发言都入料、跨两天、多时间层分层抽样＋随机、片段化并打乱顺序、冲突强制配额与基调下限（吵架没被哄好就不给纯甜梦）；顺带容忍被截断的模型输出；睡眠时长改按整夜累计安静（半夜被吵醒不再把整夜算成没睡）；内部提示不再当他说的话。
 - **0.4.1**：整理类调用加模型任务兜底链 + 双层时间预算；梦被挡/失败用人话各说一句（同晚同原因不重复，节流键是稳定 code）；入梦原料剥壳留名（`昵称：正文`）并按 `turn_clip_chars` 截；注入预算给睡眠段预留位置（激素行再挤也挤不掉"她梦见你了"）；收尾期注入她自己定的就寝钟点；`wind_down_hours` 默认 1.5 → 0.5；清理旧的「临醒窗口」死代码。
 - **0.4.0**：她自定今晚作息（planning 任务 + 防呆夹取 + 兜底公式）、睡着判定（安静阈值）、睡眠债与睡懵/补觉回补、白天主动补觉、梦改到熟睡中段生成 + 醒来确定性判定（草稿 → 转正）、日志改成人话并节流。
 - **0.3.0**：睡眠记忆整理与小本本（临醒前生成梦 + 醒来判定）、`pending_dream`、噩梦仍走潜意识阴影。
@@ -176,6 +211,6 @@ cd <实例目录> && .venv/bin/python <仓库>/test_hormone_v030.py
 
 ## 许可
 
-本项目以 **GNU Affero General Public License v3.0（AGPL-3.0）** 授权，全文见仓库 `LICENSE`。
+本项目以 **GNU Affero General Public License v3.0** 授权，全文见仓库 `LICENSE`。SPDX 标识符写作 `AGPL-3.0-only`（`manifest.json` 里用的是等价的 `AGPL-3.0`，插件市场记录按 `AGPL-3.0-only`）。
 
 选用 AGPL 是有意为之：衍生版本（含通过网络提供服务的方式）必须以同样的许可开源，并保留对本项目及「睡眠 ↔ 激素联动」想法来源（风尘笙箫）的署名。
