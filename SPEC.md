@@ -65,10 +65,11 @@ plugins/hormone_system/
 - 路径：`<bot>/data/plugins/hormone_system/<stream_id>.json`（`stream_id` 过文件名安全化，空 → `default`）
 - **原子写**：写 `.tmp` 再 `os.replace`；读失败/结构异常 → 返回 `None`，调用方重置基线，**不抛异常**
 - 每次 `on_prompt_build` 处理完立即存；后台任务在锁内读→算→存
-- `core.state_version = 3`。现行字段（生产实况）：
+- `core.state_version = 4`（v4 起梦料带 `who=user/self`）。现行字段（生产实况）：
 
-  `version, hormones, last_interaction_time, emotion_memory, recent_gaps, fatigue, topic_history, wake_up_turns, wake_up_reason, last_sleep_time, last_sleep_settle, last_sleep_kind, sleep_score, sleep_quality, sleep_thoughts, sleep_interrupted_at, sleep_debt, sleep_plan, nap, nap_date, nap_check_ts, recent_turns, pending_dream, gen_dream, sleep_journal`
+  `version, hormones, last_interaction_time, emotion_memory, recent_gaps, fatigue, topic_history, wake_up_turns, wake_up_reason, last_sleep_time, last_sleep_settle, last_sleep_kind, sleep_score, sleep_quality, sleep_thoughts, sleep_interrupted_at, sleep_debt, sleep_short_streak, sleep_awake_spans, sleep_plan, nap, nap_date, nap_check_ts, recent_turns, pending_dream, gen_dream, sleep_journal`
 
+- `recent_turns` 每条形如 `{text, score, ts, who, clipped}`；旧状态没有 `who/clipped` 时默认 `user / false`。
 - 多实例 / 多 stream 相互隔离；跨机迁移要注意 `recent_turns` 里的原料文本是本地语料，不含凭据。
 
 ## 5. 睡眠状态机
@@ -76,7 +77,10 @@ plugins/hormone_system/
 1. **夜归属**：一"夜"= 夜桶 `[night_bucket_start, night_bucket_end)`（默认 18:00→次日 12:00），`night_key` 取桶起始日；`sleep_plan` 只在同 `night_key` 内有效，过期自然回退到 config 固定作息。
 2. **定作息**：`dynamic_schedule` 开、当前钟点 ≥ `plan_at`、且今夜还没有 plan → 后台问模型 `{bedtime, duration_h, note}`；`apply_sleep_plan` 做防呆夹取（就寝 `[earliest_bedtime, latest_bedtime]` = 20:00–次日06:00，时长 1–12h，**傍晚/凌晨分别处理**，且不能定在过去）；拿不到可用模型 → `_fallback_plan`（越累越早睡、睡越久），日志会说明原因。
 3. **睡着判定**：睡眠窗内出现用户消息，只有「距上次互动安静 ≥ `sleep_onset_gap_minutes`」才置 `sleep_interrupted_at`（被吵醒）；一直聊 = 她选择陪着你，不算吵醒。阈值 0 = 旧的"窗内即吵醒"。
-4. **睡眠测量**：`_quiet_slept` 只在「本夜就寝→起床」内累计安静时长，允许早睡宽限 0.5h，**终点封顶在计划起床点**（起床后到发消息的空档不算睡），上限 14h。
+4. **睡眠测量**：`_quiet_slept` 在「本夜就寝(前 0.5h 宽限)→计划起床点」内累计安静时长，上限 14h。
+   窗内她醒着的时刻由 `_record_awake_in_night` 记进 `sleep_awake_spans`（**区间**，相邻 <10 分钟自动并成一段，长聊不会把记录撑爆）：**两句话间隔 <10 分钟算同一段清醒，超过 10 分钟的静默才算睡着**——
+   所以半夜被摸一下头、亲一口不会再让整夜作废（实测：旧口径把 6.5h 的一夜算成 1.1h）。
+   `sleep_awake_spans` 为空（旧状态 / 中途重启）时退回旧口径「上次互动 → 起床点」，不凭空多算。
 5. **结算**：第一次互动时结算；触发条件含通宵（`pre_time ≥ bed_ts`）；首启（无历史状态）与离线 >36h 不结算。`_score_sleep` 产出 `sleep_score` 与 `good/short/bad`，按质量回写激素与起床气（`wake_up_turns`/`wake_up_reason`）。
 6. **睡眠债**：`deficit = target - slept` 累加，`repay = min(债, max(0, slept-target)*0.7)`，每夜再自然消退 `debt_decay_per_night`；分类 `allnighter / short / normal / catchup / oversleep`（睡超 `target + oversleep_margin_hours` → 睡懵：降多巴胺、加疲劳）。债的存在会抬皮质醇底线、压血清素上限。**设计取向：债不必还清。**
 7. **补觉（nap）**：白天安静 ≥ `nap_quiet_minutes` 且（疲劳 > `nap_fatigue_threshold` 或 债 > `nap_debt_threshold`）且当天未补过且 `nap_per_day` 未满 → 问模型要不要睡、睡多久（0.5–2h，`nap_repay_factor` 打折回补）；问过就写 `nap_check_ts`，`nap_recheck_minutes` 内不再问（**被拒也不每轮重问**）。nap 期间消息 = 轻度吵醒（`nap_wake`）。
@@ -92,7 +96,15 @@ plugins/hormone_system/
 
 ## 7. 梦的生成与判定（两刀分开）
 
-- **原料清洗（v0.4.1）**：入梦原料来自用户消息，KFC 转发的 `[新消息]》时间》[QQ:号] 昵称 [消息id:…]：` 会被 `_normalize_relay_text` 压成「**昵称：正文**」，引用回复的 `[回复<…>：…]，说：` 嵌套壳一并剥掉；**昵称必须保留**（梦是第一人称，模型没有别的线索知道"跟谁发生的"），昵称截 12 字。剥完只剩壳的消息返回空串、不占原料。每条按 `turn_clip_chars`（默认 120）截，`…` 表示被截。剥壳发生在 `_extract_message_text`，所以**情绪打分与入梦原料同时受益**。
+- **素材从哪来（v0.4.2 重做）**：
+  - 来源是**双方**：他说的话在 `on_prompt_build` 里进料（先剥 KFC 转发信封，压成「昵称：正文」；消息 id 不要求纯数字，`proactive_xxx` 也认）；
+    **KFC 主动发言/自发思考这类内部提示不算他的话**（`<spontaneous_thought>` / `<inner_thought>` / `<system_reminder>` / `<concept>` 直接忽略：不评分、不进梦料、不刷新互动时间；历史里混进来的读盘时洗掉）。她自己发出去的话由 `HormoneSentHandler` 订阅 `on_message_sent` 进料（只取 `processed_plain_text`，`[图片/[表情/[语音/…` 这类占位与非文本跳过；没有状态文件的流不新建）。每条存 `{text, score, ts, who, clipped}`，按 `turn_clip_chars`（120）截，`clipped` 记录是否被截。
+  - 容量：上限取 `max(turn_buffer_max, dream_material_max=120)` 条，超过 `dream_material_days=2` 天的直接丢（`_prune_turns`）。
+  - 她自己的话不打分，显著性固定 0.30；**被截断的长回复减半到 0.15**（半句解释不适合当梦料）。
+  - 抽样（`get_generation_input`）：① 最近 24h 里 `score ≤ dream_conflict_threshold` 的强负面必须带 `dream_conflict_quota=2` 条；② 按时间分层「今晚(≤6h) / 今天早些(6–24h) / 更早(24h–2d)」各取最显著的一条；③ 余下按显著性补齐 `top_k`；④ 再随机抓 `dream_random_picks=1` 条换掉最弱的**非强制**项；⑤ 选中项带前后各 `dream_context_lines=1` 句上下文，拼成「他：…／我：…」片段（相邻的会合并，但单个片段最多 `2*ctx+2` 句，避免把一晚并成一大段），片段之间**打乱顺序**，整块不超过 620 字。
+  - **基调下限**：`R ≤ DREAM_R_NIGHTMARE` 仍然 nightmare（走阴影，不产内容）；否则若最近 24h 存在**未消解**的强负面（其后没有 `score ≥ dream_resolve_threshold=0.6` 的正面），基调封顶 `ambivalent`，**不给纯甜**（`dream_sweet_needs_resolve=true` 可关）。冲突窗口按 24h 算，比素材两天窗口窄，这是有意的。
+  - 生成提示词（`_DREAM_PROMPT`）明确：梦是碎的、可换场景/缝在一起；**不要照抄原句、不要把发生过的事按原样讲一遍、不要总结**；素材里有冲突就留着它，不要只挑好的一面。输出 40–70 字。
+  - 模型偶尔把 JSON 截断：`_coerce_dream(parsed, raw)` 会从原文里把 `"dream":"…"` 抠出来，不让一夜白丢。
 - **第一刀·熟睡中段生成内容**：`_dream_window_bounds` 求出本夜 `(bed_ts, wake_ts)`，`frac = (now-bed)/(wake-bed)` 落在 `[dream_mid_start_ratio, dream_mid_end_ratio)`（默认 0.3–0.7）才动手；先过三道闸——安静满 onset 阈值（还在聊不做）、本窗口未生成过（`gen_dream.ts` 或 `pending_dream.gen_ts` 早于窗起点才算没做过）、有原料（`recent_turns` Top-`top_k`）。基调由 `_compute_smoothed_aff` + 催产素/皮质醇阈值决定：`nightmare / sweet / ambivalent / neutral`，**噩梦不产内容**，交回阴影路径。
 - **第二刀·醒来确定性判定**：`_judge_pending_dream` 按 `slept` 与 `was_interrupted` 定 `recall`，`worth = recall!=none and (recall=="clear" or tone in (sweet, ambivalent))`；`_promote_pending_dream` 只把 `worth` 的写进 `gen_dream` 与小本本，草稿超过 24h 直接丢弃；通宵（`allnighter`）丢弃草稿。
 - 生成成功即清空 `recent_turns`（一夜一个梦）；**模型没成时不清原料**，下一轮继续试。
@@ -139,16 +151,18 @@ plugins/hormone_system/
 - [ ] 把 `actor` 弄成不可用，`get_model_set_by_task` 链仍能用备用任务做出梦（真模型实测过）
 - [ ] `/查看昨晚梦境` 能读出她记住的梦；她的回复里没有激素名/数字
 - [ ] 状态文件损坏 → 重置基线，不崩、不影响回复
-- [ ] 单测 **151 条**全绿（仓库根目录 `test_hormone_v030.py`，在实例根目录跑）+ 整夜 mock 端到端（`test_sim_v04_e2e.py`）
+- [ ] 单测 **184 条**全绿（仓库根目录 `test_hormone_v030.py`，在实例根目录跑）+ 整夜 mock 端到端（`test_sim_v04_e2e.py`）
 - [ ] 入梦原料形如 `昵称：正文`，没有 `[消息id:`/`[QQ:`/`[回复<` 残渣；一条 60 字的话能完整进原料
+- [ ] 她自己说的话也进梦料（`who=self`），片段里能看到「我：…」
+- [ ] 最近 24h 吵过、之后没被哄好时，梦的基调不会是纯甜（至少甜虐）
 
 **测试写法约束（踩过）**：断言不得绑真实钟点（23:00 后跑会被"不能定在过去"防呆顺推）；相位/注入类断言要**冻结 `time.time`** 到指定时刻；mock `_generate_*` 时签名要含 `report=None`；**别让随机抖动决定断言分支**——`_score_sleep` 会对激素加抖动，e2e 的 A4 偶尔落成 `quality=bad`（那走潜意识的阴影，本就不该有美梦行），所以 A6 先显式把 quality 设成 `short` 再断言「梦里还留着甜」。
 
 ## 12. 配置默认值速查（v0.4.1 实测读回）
 
-`[core]` `enabled=true` `state_dir=data/plugins/hormone_system` `baseline=50` `half_lives={多巴胺12, 皮质醇6, 催产素72, 血清素48, 内啡肽4, 共情24}` `fatigue_half_life=12` `memory_half_life_hours=1` `max_single_emotional_delta=25` `attachment_threshold=80` `memory_window=8` `max_history=40` `state_version=3`
+`[core]` `enabled=true` `state_dir=data/plugins/hormone_system` `baseline=50` `half_lives={多巴胺12, 皮质醇6, 催产素72, 血清素48, 内啡肽4, 共情24}` `fatigue_half_life=12` `memory_half_life_hours=1` `max_single_emotional_delta=25` `attachment_threshold=80` `memory_window=8` `max_history=40` `state_version=4`
 
-`[sleep]` `enabled=true` `bedtime=23.5` `wake_time=7.0` **`wind_down_hours=0.5`** `groggy_hours=1.0` `shadow_window_hours=24` `consolidate=true` `consolidate_model_task=""` `dream_mid_start_ratio=0.3` `dream_mid_end_ratio=0.7` `dream_check_minutes=15` `journal_max_days=3` `top_k=5` `turn_buffer_max=40` **`turn_clip_chars=120`** `consolidate_timeout_seconds=25.0` `consolidate_total_seconds=60.0` `inject_journal=true` `sleep_onset_gap_minutes=30` `target_sleep_hours=6.0` `sleep_debt_enabled=true` `sleep_debt_cap_hours=12` `debt_decay_per_night=0.8` `oversleep_margin_hours=2.5` `dynamic_schedule=true` `timezone="Asia/Shanghai"` `night_bucket_start=18.0` `night_bucket_end=12.0` `plan_at=21.5` `plan_check_minutes=10` `plan_sane_min_hours=1` `plan_sane_max_hours=12` `earliest_bedtime=20` `latest_bedtime=30` `nap_enabled=true` `nap_check_minutes=20` `nap_quiet_minutes=40` `nap_min_hours=0.5` `nap_max_hours=2` `nap_repay_factor=0.5` `nap_per_day=1` `nap_fatigue_threshold=60` `nap_debt_threshold=2` `nap_recheck_minutes=60` `state_log_minutes=30` `dream_pre_wake_hours=1.0`（已弃用，只为兼容旧 config.toml）
+`[sleep]` `enabled=true` `bedtime=23.5` `wake_time=7.0` **`wind_down_hours=0.5`** `groggy_hours=1.0` `shadow_window_hours=24` `consolidate=true` `consolidate_model_task=""` `dream_mid_start_ratio=0.3` `dream_mid_end_ratio=0.7` `dream_check_minutes=15` `journal_max_days=3` `top_k=5` `turn_buffer_max=40` `dream_material_max=120` `dream_material_days=2.0` `dream_context_lines=1` `dream_random_picks=1` `dream_conflict_quota=2` `dream_conflict_threshold=-0.45` `dream_resolve_threshold=0.6` `dream_sweet_needs_resolve=true` **`turn_clip_chars=120`** `consolidate_timeout_seconds=25.0` `consolidate_total_seconds=60.0` `inject_journal=true` `sleep_onset_gap_minutes=30` `target_sleep_hours=6.0` `sleep_debt_enabled=true` `sleep_debt_cap_hours=12` `debt_decay_per_night=0.8` `oversleep_margin_hours=2.5` `dynamic_schedule=true` `timezone="Asia/Shanghai"` `night_bucket_start=18.0` `night_bucket_end=12.0` `plan_at=21.5` `plan_check_minutes=10` `plan_sane_min_hours=1` `plan_sane_max_hours=12` `earliest_bedtime=20` `latest_bedtime=30` `nap_enabled=true` `nap_check_minutes=20` `nap_quiet_minutes=40` `nap_min_hours=0.5` `nap_max_hours=2` `nap_repay_factor=0.5` `nap_per_day=1` `nap_fatigue_threshold=60` `nap_debt_threshold=2` `nap_recheck_minutes=60` `state_log_minutes=30` `dream_pre_wake_hours=1.0`（已弃用，只为兼容旧 config.toml）
 
 `[score]` `enabled=true` `model_task=""`（跟随对话模型）`timeout_seconds=8.0` `max_input_chars=600`；`[idle_drift]/[topic]/[chronic_states]/[fallback_reply]` 默认开（`fallback_reply` 只留接口，未接生成链路）。
 
@@ -169,6 +183,7 @@ plugins/hormone_system/
 - **v0.2.0**：睡眠 ↔ 激素双向耦合（睡眠质量 / 梦境碎片 / 起床缓冲 / 潜意识阴影 / 相位语气），按墙钟自动结算。
 - **v0.3.0**：睡眠记忆整理与「小本本」——临醒前生成梦、醒来判定 recall/worth、`pending_dream`、`journal_max_days`。
 - **v0.4.0**：她自定今晚作息（planning + 防呆 + 兜底公式）、睡着判定（安静阈值）、睡眠债与睡懵/补觉回补、白天主动补觉、梦移到熟睡中段生成 + 醒来确定性判定、日志人话化与节流。多轮自审共修 12 个真问题（就寝前安静被算作睡眠、调度间隔忽略 plan/nap、离线 >36h 仍结算、草稿无过期、转正梦缺 `ts`、19:00 被夹成 06:00、补觉被拒每 10 分钟重问、通宵不结算、跨午夜去重错位、醒着也生成梦、起床后时间算睡眠、日志 helper 拖垮任务）。
+- **v0.4.2**：重做梦的素材机制——双方发言入料（新增 `on_message_sent` 处理器）、跨两天 120 条、多时间层分层抽样＋随机、片段化并打乱、冲突强制配额与基调下限（未消解的吵架不给纯甜梦）；容忍被截断的模型输出；睡眠时长改按整夜累计安静（`sleep_awake_spans` 区间，<10 分钟间隔算同一段），半夜被吵醒不再作废整夜；内部提示不再当他说的话（两天里 70 次主动发言曾被算成互动、5 次挡住梦窗）；`state_version=4`。
 - **v0.4.1**：整理类调用加模型任务候选链与双层时间预算（主回复模型欠费时梦还能做出来）；梦被挡/失败用人话各说一句并节流（键改稳定原因码）；入梦原料剥壳留名（`昵称：正文`，昵称截 12 字；只剩壳的消息不占原料）＋长度改 `turn_clip_chars=120`；注入预算给睡眠段预留位置；收尾期注入她自己定的就寝钟点；`wind_down_hours` 默认 1.5 → 0.5；删「临醒窗口」死代码。
 - **v0.4.1 实盘复盘（2026-10-24 第一夜）**：01:37 主模型 `actor` 失败、`sub_actor` 兜底把两个会话的梦都做出来；醒来结算 7.0h/质量良好、`recall=clear worth=True` 进小本本；樱爱那台 3.3h 被吵醒的夜仍按 `fuzzy+甜` 判成值得记；同夜暴露两个真问题——节流键里带分钟数导致一夜四行、原料 80 字被信封吃掉 63 字只剩 17 字（已修）。
 

@@ -197,8 +197,11 @@ def _debt_line(system: "HormoneSystem", config: HormoneSystemConfig) -> str:
         return "- 睡得有点过头，脑子昏昏沉沉的。"
     if kind == "catchup":
         return "- 补了一觉，缓过来一点，但身上还留着点倦。"
+    streak = int(getattr(system, "sleep_short_streak", 0) or 0)
     if debt > 4.0:
-        return "- 连着几天没睡够，脑袋发沉、容易烦躁。"
+        if streak >= 2:
+            return "- 连着几天没睡够，脑袋发沉、容易烦躁。"
+        return "- 昨晚几乎没怎么睡，现在人发空、容易烦躁。"
     if debt > 2.0:
         return "- 还有点没缓过来，精力不太够。"
     if kind == "short":

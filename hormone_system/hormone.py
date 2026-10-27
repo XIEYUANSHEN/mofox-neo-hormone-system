@@ -110,6 +110,15 @@ DREAM_R_SWEET = 0.15           # R ≥ 此值 → 偏正（美梦倾向）
 DREAM_W_OXYTOCIN = 70.0        # 催产素达此视为「够在意」→ 值得梦到你
 DREAM_W_CORSTRESS = 45.0       # 混合基调所需的「残存焦虑」皮质醇下限
 DREAM_AMBIVALENT_PROB = 0.15   # 满足条件时，混合梦低频冒出的概率
+# KFC 主动发言/自发思考这类"内部提示"不是他说的话：不评分、不进梦料。
+# 只认实测见过的标记（proactive 注入的 content 里就是它）；不猜别的标签，
+# 免得误伤真正在聊提示词的人。
+INTERNAL_MARKERS = ("<spontaneous_thought>",)
+
+DREAM_SELF_SALIENCE = 0.30     # 她自己说的话的固定显著性（够格入梦、不压过强情绪）
+DREAM_FRAGMENT_MAX_CHARS = 620 # 整块梦料送进模型的字数上限
+DREAM_RECENT_HOURS = 6.0       # 「今晚」这一层
+DREAM_MID_HOURS = 24.0         # 「今天早些/昨天」这一层
 # 显著性分档（|情绪分| 主导）：喂给模型时决定详略
 SALIENCE_HIGH = 0.5
 SALIENCE_MID = 0.25
@@ -170,6 +179,8 @@ class HormoneSystem:
         self.sleep_journal: list[dict] = []       # 小本本（有界环形）
         self.gen_dream: dict | None = None        # 生成的非噩梦 {text,tone,recall,worth,ts}
         self.sleep_debt: float = 0.0              # 睡眠债（小时）
+        self.sleep_short_streak: int = 0          # 连续短睡/通宵的夜数（文案区分“昨晚”与“连着几天”）
+        self.sleep_awake_spans: list[list[float]] = []  # 本夜窗内“醒着”的区间（按累计安静测睡眠用）
         self.last_sleep_kind: str = ""            # 最近一晚类型：allnighter/short/normal/catchup/oversleep
         self.sleep_plan: dict | None = None       # 今晚自定作息 {night_key,bedtime,dur_h,wake,decided_at,source,note}
         self.nap: dict | None = None              # 补觉 session {start_ts,wake_ts,dur_h,source}
@@ -690,13 +701,47 @@ class HormoneSystem:
             return b <= hour < w
         return hour >= b or hour < w
 
+    def _record_awake_in_night(
+        self, now: float, bedtime: float, wake: float
+    ) -> None:
+        """now 落在本夜窗（就寝前 0.5h ~ 起床点）内，就记一笔"醒着"。"""
+        span_h = (wake - bedtime) % 24.0 or 8.0
+        wake_ts0 = self._day_anchor(now, wake)
+        span_s = span_h * 3600.0
+        for off in (0.0, -86400.0, 86400.0):
+            wake_ts = wake_ts0 + off
+            bed_ts = wake_ts - span_s
+            if bed_ts - 0.5 * 3600.0 <= now < wake_ts:
+                self._record_awake(now)
+                return
+
+    def _record_awake(self, now: float) -> None:
+        """记一笔「本夜空内醒着」的时间，并合并成区间。
+
+        合并规则：和上一段末尾相隔 <10 分钟就算同一段清醒（一直聊=一段）。
+        存区间而不是散点，长聊也不会把记录撑爆、也不会把早先的聊天弄丢。
+        """
+        now = float(now)
+        if self.sleep_awake_spans:
+            last = self.sleep_awake_spans[-1]
+            if now - float(last[1]) < 600.0:
+                last[1] = max(float(last[1]), now)
+                last[0] = min(float(last[0]), now)
+                return
+        self.sleep_awake_spans.append([now, now])
+        if len(self.sleep_awake_spans) > 40:
+            self.sleep_awake_spans = self.sleep_awake_spans[-40:]
+
     def _quiet_slept(
         self, start: float, end: float, bedtime: float, wake: float
     ) -> float:
-        """[start,end] 在「本夜就寝→起床」内的安静小时数（封顶 14h）。
+        """本夜「累计安静」的小时数（封顶 14h）。
 
-        就寝前的安静不算睡眠（她可能只是没聊）；允许半小时早睡宽限；
-        睡眠终点封顶在计划起床点，起床后到发消息的空档不算睡。
+        以前只量「最后一次互动到起床点」，于是半夜被摸一下头、亲一口就
+        把整夜作废（实测：两次深夜互动 → 只算成睡了 1.1h）。现在把窗内
+        醒着的时刻都记下来，累计安静段：两句话之间隔不到 10 分钟算同一段
+        清醒，超过 10 分钟的静默才算睡着。
+        就寝前的安静不算（除非在半小时宽限内）；终点封顶在计划起床点。
         """
         if end <= start:
             return 0.0
@@ -705,8 +750,28 @@ class HormoneSystem:
         if span_h <= 0.0:
             span_h = 8.0
         bed_ts = wake_ts - span_h * 3600.0
-        lo = max(start, bed_ts - 0.5 * 3600.0)
+        night_lo = bed_ts - 0.5 * 3600.0     # 允许半小时早睡宽限
         hi = min(end, wake_ts)
+        if hi <= night_lo:
+            return 0.0
+        spans = [
+            [max(night_lo, float(a)), min(hi, float(b))]
+            for a, b in self.sleep_awake_spans
+            if float(b) >= night_lo and float(a) <= hi
+        ]
+        if spans:
+            # 有醒着记录：整夜累计安静（不因为最后一次互动把前面几小时作废）
+            quiet = 0.0
+            cursor = night_lo
+            for a, b in sorted(spans):
+                if a - cursor >= 600.0:
+                    quiet += a - cursor
+                cursor = max(cursor, b)
+            if hi - cursor >= 600.0:
+                quiet += hi - cursor
+            return min(14.0, quiet / 3600.0)
+        # 没有醒着记录（旧状态/中途重启）：退回"上次互动→起床点"
+        lo = max(start, night_lo)
         if hi <= lo:
             return 0.0
         return min(14.0, (hi - lo) / 3600.0)
@@ -751,6 +816,12 @@ class HormoneSystem:
             self.sleep_interrupted_at = 0.0
 
         # 夜里来消息：睡着（安静够久）才算吵醒；一直聊 / 还没定作息 = 醒着
+        # 本夜窗内（含就寝前半小时宽限）醒着的时刻都记下来：睡眠时长按累计安静算
+        try:
+            self._record_awake_in_night(now, bedtime, wake_h)
+        except Exception:  # noqa: BLE001 - 记账失败不影响睡眠判定
+            pass
+
         if self._in_window(now, bedtime, wake_h):
             gap_min = (now - pre_time) / 60.0
             if not allow_wake or gap_min < cfg.sleep_onset_gap_minutes:
@@ -776,10 +847,12 @@ class HormoneSystem:
             if now - pre_time > 36.0 * 3600.0 or not self._state_loaded:
                 # 离线太久 / 首启无历史：没有可靠睡眠信息，只清中断标记、不结算
                 self.sleep_interrupted_at = 0.0
+                self.sleep_awake_spans = []
             else:
                 slept = self._quiet_slept(pre_time, now, bedtime, wake_h)
                 was_interrupted = self.sleep_interrupted_at > 0.0
                 self.sleep_interrupted_at = 0.0
+                self.sleep_awake_spans = []
                 # 通宵（整夜在聊、slept≈0）也要结算：当夜有过互动即算
                 if slept >= 0.5 or was_interrupted or pre_time >= bed_ts:
                     self._settle_last_sleep(pre_snap, slept, was_interrupted, now)
@@ -923,6 +996,10 @@ class HormoneSystem:
             else:
                 kind = "normal"
             self.last_sleep_kind = kind
+            if kind in ("short", "allnighter"):
+                self.sleep_short_streak += 1
+            else:
+                self.sleep_short_streak = 0
             deficit = max(0.0, target - slept)
             repay = min(self.sleep_debt, max(0.0, slept - target) * 0.7)
             self.sleep_debt = max(
@@ -938,6 +1015,7 @@ class HormoneSystem:
         else:
             self.last_sleep_kind = "normal"
             self.sleep_debt = 0.0
+            self.sleep_short_streak = 0
 
         if self.last_sleep_kind == "allnighter":
             self.pending_dream = None  # 通宵不算有梦
@@ -1258,25 +1336,53 @@ class HormoneSystem:
                 self.sleep_journal = self.sleep_journal[-limit:]
 
     # ---------- 睡眠记忆整理 / 梦生成辅助 ----------
-    def _push_recent_turn(self, text: str, score: float) -> None:
-        """把本轮用户消息截断后压入 recent_turns（仅 consolidate 开启时被调用）。"""
+    def _material_cap(self) -> int:
+        """梦料条数上限：兼容旧的 turn_buffer_max，取两者里大的。"""
+        cfg = self._cfg.sleep
+        return max(
+            int(getattr(cfg, "turn_buffer_max", 40)),
+            int(getattr(cfg, "dream_material_max", 120)),
+        )
+
+    def _prune_turns(self, now: float) -> None:
+        """修剪梦料：超过 dream_material_days 的丢掉，超量从最早的挤掉。"""
+        days = float(getattr(self._cfg.sleep, "dream_material_days", 2.0))
+        cutoff = now - days * 86400.0
+        kept = [t for t in self.recent_turns if float(t.get("ts", 0.0)) >= cutoff]
+        self.recent_turns = kept[-self._material_cap():]
+
+    def _push_recent_turn(
+        self, text: str, score: float, who: str = "user"
+    ) -> None:
+        """把一句话截断后压入梦料（双方都记；仅 consolidate 开启时被调用）。"""
         if not text or not text.strip():
             return  # 只有引用壳/空内容的消息不该占一条原料
         limit = int(getattr(self._cfg.sleep, "turn_clip_chars", 120))
-        clip = text if len(text) <= limit else text[:limit] + "…"
+        clipped = len(text) > limit
+        clip = text if not clipped else text[:limit] + "…"
+        now = time.time()
         self.recent_turns.append(
             {
                 "text": clip,
                 "score": float(self._clamp(score, -1.0, 1.0, 0.0)),
-                "ts": time.time(),
+                "ts": now,
+                "who": "self" if who == "self" else "user",
+                "clipped": clipped,
             }
         )
-        cap = self._cfg.sleep.turn_buffer_max
-        if len(self.recent_turns) > cap:
-            self.recent_turns.pop(0)
+        self._prune_turns(now)
+
+    def record_self_turn(self, text: str) -> None:
+        """把她自己说出口的话也记进梦料（不打分，用固定显著性参与抽样）。"""
+        if not self._cfg.sleep.consolidate:
+            return
+        self._push_recent_turn(text, 0.0, who="self")
 
     def _turn_salience(self, item: dict) -> float:
-        """单条原料的显著性：|情绪分| 为主，依恋/共情高位时加一点权重。"""
+        """单条原料的显著性：|情绪分| 为主；她自己说的话给固定中等权重。"""
+        if str(item.get("who", "user")) == "self":
+            # 被截断的长回复（多半是解释/边界话）降权：半句不适合当梦料
+            return DREAM_SELF_SALIENCE * (0.5 if item.get("clipped") else 1.0)
         base = abs(float(item.get("score", 0.0)))
         bonus = 0.0
         if self.hormones.get("oxytocin", 50.0) > 70:
@@ -1285,31 +1391,161 @@ class HormoneSystem:
             bonus += 0.10
         return base + bonus
 
-    def get_generation_input(self) -> tuple[list[dict], str | None]:
-        """取整理原料 Top-K 与梦基调 hint，供插件层调模型生成。
+    def _conflict_state(self, now: float) -> tuple[bool, float]:
+        """最近 24h 的（是否有未消解的强负面，最负的那一分）。"""
+        cfg = self._cfg.sleep
+        thr = float(getattr(cfg, "dream_conflict_threshold", -0.45))
+        resolve = float(getattr(cfg, "dream_resolve_threshold", 0.6))
+        since = now - 24.0 * 3600.0
+        recent = [
+            t for t in self.recent_turns
+            if float(t.get("ts", 0.0)) >= since and str(t.get("who", "user")) == "user"
+        ]
+        peak = 0.0
+        last_bad = -1
+        for i, t in enumerate(recent):
+            sc = float(t.get("score", 0.0))
+            peak = min(peak, sc)
+            if sc <= thr:
+                last_bad = i
+        if last_bad < 0:
+            return False, peak
+        resolved = any(
+            float(t.get("score", 0.0)) >= resolve for t in recent[last_bad + 1:]
+        )
+        return (not resolved), peak
 
-        返回 (topk_items, tone)，tone ∈ {'sweet','neutral','ambivalent','nightmare'} 或 None。
-        'nightmare' 交回既有 v0.2.0 阴影路径，本函数不生成噩梦内容。
+    def get_generation_input(self) -> tuple[list[dict], str | None]:
+        """抽梦料片段与梦基调，供插件层调模型生成。
+
+        素材 = 最近 dream_material_days 天、双方说过的话。挑法：
+        ① 最近 24h 的强负面必须带 dream_conflict_quota 条进梦；
+        ② 按时间分层（今晚 / 今天早些 / 更早）各取最显著的一条；
+        ③ 余下按显著性补齐 top_k；④ 再随机抓 dream_random_picks 条换掉最弱的非强制项；
+        ⑤ 每条带前后上下文拼成「他：…／我：…」片段，片段之间打乱顺序。
+        返回 (fragments, tone)，tone ∈ {'sweet','neutral','ambivalent','nightmare'} 或 None。
+        有未消解的冲突时基调封顶 ambivalent（不给她做纯甜梦）；nightmare 交回阴影路径。
         """
         cfg = self._cfg.sleep
         if not cfg.consolidate or not self.recent_turns:
             return [], None
-        ranked = sorted(self.recent_turns, key=self._turn_salience, reverse=True)
-        topk = ranked[: cfg.top_k]
+        now = time.time()
+        turns = self.recent_turns
+        n = len(turns)
+        top_k = max(1, int(cfg.top_k))
+        picked: list[int] = []
+        mandatory: set[int] = set()
+
+        def take(i: int, force: bool = False) -> None:
+            if 0 <= i < n and i not in picked:
+                picked.append(i)
+                if force:
+                    mandatory.add(i)
+
+        # ① 冲突配额：最近 24h 最负的几条必须入梦
+        quota = int(getattr(cfg, "dream_conflict_quota", 2))
+        thr = float(getattr(cfg, "dream_conflict_threshold", -0.45))
+        if quota > 0:
+            bad = [
+                (i, t) for i, t in enumerate(turns)
+                if now - float(t.get("ts", 0.0)) <= 24.0 * 3600.0
+                and str(t.get("who", "user")) == "user"
+                and float(t.get("score", 0.0)) <= thr
+            ]
+            bad.sort(key=lambda it: float(it[1].get("score", 0.0)))
+            for i, _ in bad[:quota]:
+                take(i, force=True)
+
+        # ② 时间分层：今晚 / 今天早些 / 更早，各取最显著的一条
+        days = float(getattr(cfg, "dream_material_days", 2.0))
+        bands = (
+            (0.0, DREAM_RECENT_HOURS * 3600.0),
+            (DREAM_RECENT_HOURS * 3600.0, DREAM_MID_HOURS * 3600.0),
+            (DREAM_MID_HOURS * 3600.0, days * 86400.0),
+        )
+        for lo, hi in bands:
+            cand = [
+                (i, t) for i, t in enumerate(turns)
+                if lo <= (now - float(t.get("ts", 0.0))) < hi
+            ]
+            if cand:
+                cand.sort(key=lambda it: self._turn_salience(it[1]), reverse=True)
+                take(cand[0][0])
+
+        # ③ 显著性补齐
+        for i in sorted(range(n), key=lambda j: self._turn_salience(turns[j]), reverse=True):
+            if len(picked) >= top_k:
+                break
+            take(i)
+
+        # ④ 随机换掉最弱的非强制项：梦要有跳跃，不能每次都是同一批
+        rand_n = int(getattr(cfg, "dream_random_picks", 1))
+        if rand_n > 0:
+            pool = [i for i in range(n) if i not in picked]
+            random.shuffle(pool)
+            for i in pool[:rand_n]:
+                swappable = [j for j in picked if j not in mandatory]
+                if not swappable:
+                    break
+                weakest = min(swappable, key=lambda j: self._turn_salience(turns[j]))
+                picked.remove(weakest)
+                take(i)
+
+        # ⑤ 片段化：带上下文、合并重叠，再打乱片段顺序（梦不按时间走）
+        ctx = int(getattr(cfg, "dream_context_lines", 1))
+        spans: list[list[int]] = []
+        for i in sorted(picked):
+            lo, hi = max(0, i - ctx), min(n - 1, i + ctx)
+            if spans and lo <= spans[-1][1] + 1:
+                spans[-1][1] = max(spans[-1][1], hi)
+            else:
+                spans.append([lo, hi])
+        # 一个片段最多 2*ctx+2 句：相邻好几条一起被选中时，别把一整晚并成一大段
+        max_len = 2 * ctx + 2
+        split: list[list[int]] = []
+        for lo, hi in spans:
+            cur = lo
+            while cur <= hi:
+                split.append([cur, min(hi, cur + max_len - 1)])
+                cur += max_len
+        spans = split
+        frags: list[dict] = []
+        for lo, hi in spans:
+            parts: list[str] = []
+            strength = 0.0
+            for j in range(lo, hi + 1):
+                t = turns[j]
+                prefix = "我" if str(t.get("who", "user")) == "self" else "他"
+                parts.append(f"{prefix}：{t.get('text', '')}")
+                strength = max(strength, abs(float(t.get("score", 0.0))))
+            frags.append({"text": " ／ ".join(parts), "score": round(strength, 3)})
+        random.shuffle(frags)
+        out: list[dict] = []
+        used = 0
+        for f in frags:
+            if out and used + len(f["text"]) > DREAM_FRAGMENT_MAX_CHARS:
+                continue
+            out.append(f)
+            used += len(f["text"])
+
+        # 基调：有未消解的冲突就不给纯甜
         R = self._compute_smoothed_aff()
         oxy = self.hormones.get("oxytocin", 50.0)
         cor = self.hormones.get("cortisol", 50.0)
         if R <= DREAM_R_NIGHTMARE:
-            return topk, "nightmare"
+            return out, "nightmare"
+        unresolved, _peak = self._conflict_state(now)
+        if unresolved and bool(getattr(cfg, "dream_sweet_needs_resolve", True)):
+            return out, "ambivalent"
         if R >= DREAM_R_SWEET or oxy >= DREAM_W_OXYTOCIN:
             if (
                 oxy >= DREAM_W_OXYTOCIN
                 and cor >= DREAM_W_CORSTRESS
                 and random.random() < DREAM_AMBIVALENT_PROB
             ):
-                return topk, "ambivalent"
-            return topk, "sweet"
-        return topk, "neutral"
+                return out, "ambivalent"
+            return out, "sweet"
+        return out, "neutral"
 
     def apply_generated_dream(
         self, dream_text: str, tone: str, recall: str, worth: bool
@@ -1438,6 +1674,8 @@ class HormoneSystem:
             "sleep_journal": [dict(j) for j in self.sleep_journal],
             "gen_dream": dict(self.gen_dream) if self.gen_dream else None,
             "sleep_debt": float(self.sleep_debt),
+            "sleep_short_streak": int(self.sleep_short_streak),
+            "sleep_awake_spans": [[float(a), float(b)] for a, b in self.sleep_awake_spans],
             "last_sleep_kind": str(self.last_sleep_kind),
             "sleep_plan": dict(self.sleep_plan) if self.sleep_plan else None,
             "nap": dict(self.nap) if self.nap else None,
@@ -1538,14 +1776,20 @@ class HormoneSystem:
             turns: list[dict] = []
             for item in raw_rt:
                 if isinstance(item, dict) and "text" in item:
+                    text = str(item.get("text", ""))
+                    if any(m in text for m in INTERNAL_MARKERS):
+                        continue  # 历史里混进来的系统内部提示，读盘时直接丢掉
+                    who = "self" if str(item.get("who", "user")) == "self" else "user"
                     turns.append(
                         {
                             "text": str(item.get("text", "")),
                             "score": self._clamp(item.get("score", 0.0), -1.0, 1.0, 0.0),
                             "ts": float(item.get("ts", time.time())),
+                            "who": who,
+                            "clipped": bool(item.get("clipped", False)),
                         }
                     )
-            self.recent_turns = turns[-self._cfg.sleep.turn_buffer_max:]
+            self.recent_turns = turns[-self._material_cap():]
 
         raw_jn = data.get("sleep_journal", [])
         if isinstance(raw_jn, list):
@@ -1563,6 +1807,33 @@ class HormoneSystem:
         kind = data.get("last_sleep_kind")
         if isinstance(kind, str):
             self.last_sleep_kind = kind
+        raw_spans = data.get("sleep_awake_spans")
+        spans: list[list[float]] = []
+        if isinstance(raw_spans, list):
+            for it in raw_spans[-40:]:
+                if isinstance(it, (list, tuple)) and len(it) >= 2:
+                    try:
+                        spans.append([float(it[0]), float(it[1])])
+                    except (TypeError, ValueError):
+                        continue
+        else:
+            # 兼容 0.4.2 早期写的散点字段：相邻 <10 分钟的合并成一段
+            raw_pts = data.get("sleep_awake_ts")
+            if isinstance(raw_pts, list):
+                for x in raw_pts:
+                    if isinstance(x, (int, float)) and not isinstance(x, bool):
+                        p = float(x)
+                        if spans and p - spans[-1][1] < 600.0:
+                            spans[-1][1] = max(spans[-1][1], p)
+                        else:
+                            spans.append([p, p])
+        self.sleep_awake_spans = spans[-40:]
+        streak = data.get("sleep_short_streak")
+        if isinstance(streak, int) and not isinstance(streak, bool) and streak >= 0:
+            self.sleep_short_streak = min(30, streak)
+        elif self.last_sleep_kind in ("short", "allnighter"):
+            # 旧状态没这个字段：至少承认"昨晚就是短睡"，别让文案退回泛泛而谈
+            self.sleep_short_streak = 1
 
         raw_plan = data.get("sleep_plan")
         if isinstance(raw_plan, dict) and raw_plan.get("night_key"):

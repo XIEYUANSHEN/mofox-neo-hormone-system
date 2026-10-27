@@ -100,6 +100,10 @@ check("A2 睡前一直聊不判吵醒", sA.sleep_interrupted_at == 0.0 and sA._s
       f"stage={sA._sleep_stage} interrupted={sA.sleep_interrupted_at}")
 storeA.save("A", sA.to_state(cfgA.core.state_version))
 
+# 睡前一直聊到 02:30（密集发言=醒着），02:30 之后才真睡 -> 这一夜约睡 4h
+sA.sleep_awake_spans = [[ts(23, 23, 40), ts(24, 2, 25)]]
+storeA.save("A", sA.to_state(cfgA.core.state_version))
+
 # 03:00 熟睡中段 -> 生成梦草稿
 Clock.now = ts(24, 3, 0)
 asyncio.run(inst(cfgA)._consolidate_job())

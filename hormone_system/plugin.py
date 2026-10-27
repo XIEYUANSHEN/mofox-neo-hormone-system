@@ -31,7 +31,7 @@ from src.app.plugin_system.base import (
 from src.app.plugin_system.api.event_api import EventDecision
 
 from .config import HormoneSystemConfig
-from .hormone import HormoneSystem
+from .hormone import INTERNAL_MARKERS, HormoneSystem
 from .prompt import build_mood_prompt
 from .state_store import HormoneStateStore
 
@@ -103,7 +103,7 @@ def _clip_text(text: str, limit: int) -> str:
 # 但昵称必须留：梦是第一人称写的，模型手里没有别的线索能知道"这些事是跟谁发生的"。
 _RELAY_ENVELOPE = re.compile(
     r"(?:\[新消息\]\s*)?(?:》[^》]{0,60}》\s*)*(?:\[QQ:\s*\d+\]\s*)?"
-    r"(?P<name>[^\[\]\n：:]{0,40}?)\s*\[消息id[:：]\s*\d+\]\s*[：:]?\s*",
+    r"(?P<name>[^\[\]\n：:]{0,40}?)\s*\[消息id[:：]\s*[^\]\n]{1,64}\]\s*[：:]?\s*",
     re.S,
 )
 # 引用回复的嵌套壳：`[回复<昵称(id)：被引的原话]，说：真正说出口的话`
@@ -169,30 +169,43 @@ def _parse_emotions(raw: str) -> dict[str, float] | None:
 
 
 _DREAM_PROMPT = (
-    "你要替'她'写一段今晚睡觉时可能做的梦，第一人称、口吻贴合角色，控制在 60 字内，"
+    "你要替'她'写一段今晚睡觉时做的梦：第一人称、口吻贴合角色，40–70 字，"
     "不出现任何数字和激素名称。\n"
-    "基调（tone）会告诉你梦偏甜(sweet)/偏中性(neutral)/甜虐交织(ambivalent)；"
-    "下面附上她白天情绪波动最大的几件事作为素材，梦可以从里面延伸、变形，但不必逐条复述。\n"
+    "素材是她这几天说过、听过的一些对话片段（'他'指对方、'我'指她自己），来自不同的时候，顺序是打乱的。\n"
+    "梦是碎的、不讲逻辑的：可以换场景、把人或事缝在一起、跳过因果，也可以只留一个画面或一句话。\n"
+    "**不要照抄原句，也不要把发生过的事按原样讲一遍**——最多留一个画面或一句语气，其余都要变形；"
+    "不要总结，也不必把每段都写进去。\n"
+    "基调（tone）告诉你梦偏甜(sweet)/偏中性(neutral)/甜虐交织(ambivalent)。"
+    "如果素材里带着冲突、委屈或没说完的话，梦里要留着它，不要只挑好的一面。\n"
     '只输出 JSON，不要解释、不要 markdown。例：{"dream":"…"}'
 )
 
 
-def _coerce_dream(parsed: dict | None) -> dict | None:
+def _coerce_dream(parsed: dict | None, raw: str | None = None) -> dict | None:
     """把模型输出规整为 {dream, recall, worth}；非 dict 或 dream 空 → None。
 
     recall 归一到 clear/fuzzy/none；worth 兼容字符串("false"等)与布尔。
+    模型偶尔把 JSON 截断（"dream":"… 后面没闭合），此时从原文里把 dream 抠出来，
+    不让一夜的梦白丢。
     """
-    if not isinstance(parsed, dict) or not parsed.get("dream"):
+    dream = ""
+    if isinstance(parsed, dict):
+        dream = str(parsed.get("dream", "") or "")
+    if not dream and raw:
+        m = re.search(r'"dream"\s*:\s*"(.+)', raw, re.S)
+        if m:
+            dream = m.group(1).split('"')[0].strip()
+    if not dream:
         return None
-    recall = str(parsed.get("recall", "fuzzy"))
+    recall = str((parsed or {}).get("recall", "fuzzy"))
     if recall not in ("clear", "fuzzy", "none"):
         recall = "fuzzy"
-    raw_worth = parsed.get("worth", False)
+    raw_worth = (parsed or {}).get("worth", False)
     if isinstance(raw_worth, str):
         worth = raw_worth.strip().lower() in ("true", "1", "yes", "是")
     else:
         worth = bool(raw_worth)
-    return {"dream": str(parsed.get("dream", ""))[:160], "recall": recall, "worth": worth}
+    return {"dream": dream[:160], "recall": recall, "worth": worth}
 
 
 # 整理类调用（做梦/定作息/补觉）的模型任务候选链：首选没成就往后退。
@@ -296,13 +309,13 @@ async def _generate_dream(
     material = "\n".join(
         f"- {it.get('text', '')}" for it in items if it.get("text")
     )
-    user_text = f"基调：{tone}\n白天她在意的事：\n{material}"
+    user_text = f"基调：{tone}\n素材（来自不同时间、顺序已打乱）：\n{material}"
     raw = await _call_consolidate_llm(
         config, _DREAM_PROMPT, user_text, "hormone_dream", report=report
     )
     if raw is None:
         return None
-    out = _coerce_dream(_parse_emotions(raw))
+    out = _coerce_dream(_parse_emotions(raw), raw)
     if out is None:
         logger.debug(f"梦生成无法解析: {raw[:60]!r}")
         if report is not None:
@@ -491,6 +504,10 @@ class HormonePromptHandler(BaseEventHandler):
         elif not isinstance(content, str):
             content = str(content)
 
+        # KFC 主动发言/自发思考这类内部提示不是他说的话：当没有消息处理
+        if any(m in content for m in INTERNAL_MARKERS):
+            return ""
+
         # 剥离 KFC last-mile 指令（"\n\n---\n" 后的行为指令部分）
         separator_idx = content.rfind("\n\n---\n")
         if separator_idx >= 0:
@@ -623,6 +640,73 @@ class HormonePromptHandler(BaseEventHandler):
         return EventDecision.SUCCESS, params
 
 
+_SENT_SKIP_PREFIXES = (
+    "[图片", "[表情", "[语音", "[视频", "[文件", "[json", "[CQ:", "[回复", "[合并转发",
+)
+
+
+def _extract_sent_text(message: Any) -> str:
+    """从「已发出」的 Message 里取纯文本；非文本 / 占位内容返回空串。"""
+    try:
+        text = getattr(message, "processed_plain_text", "") or ""
+        if not text:
+            raw = getattr(message, "content", "")
+            text = raw if isinstance(raw, str) else ""
+        text = " ".join(str(text).split())
+        if len(text) < 2:
+            return ""
+        if text.startswith(_SENT_SKIP_PREFIXES):
+            return ""
+        return text
+    except Exception:  # noqa: BLE001 - 取文本失败就当没这条
+        return ""
+
+
+class HormoneSentHandler(BaseEventHandler):
+    """把她自己发出去的文本记进梦料——梦是双方的对话，不该只有他一个人的回声。"""
+
+    name: str = "hormone_sent_handler"
+    description: str = "记录她自己的发言，供熟睡时做梦当素材"
+    weight: int = 6
+    intercept_message: bool = False
+    init_subscribe: list[str] = ["on_message_sent"]
+
+    def __init__(self, plugin: Any) -> None:
+        """持有插件引用即可，配置与存储在调用时再取。"""
+        super().__init__(plugin)
+
+    async def execute(
+        self, event_name: str, params: dict[str, Any]
+    ) -> tuple[EventDecision, dict[str, Any]]:
+        """只在已有状态文件的会话里追加一条她的发言；失败绝不影响发消息。"""
+        try:
+            config = getattr(self.plugin, "config", None)
+            if not isinstance(config, HormoneSystemConfig):
+                return EventDecision.SUCCESS, params
+            if not config.core.enabled or not config.sleep.consolidate:
+                return EventDecision.SUCCESS, params
+            message = params.get("message") if isinstance(params, dict) else None
+            if message is None:
+                return EventDecision.SUCCESS, params
+            stream_id = str(getattr(message, "stream_id", "") or "")
+            text = _extract_sent_text(message)
+            if not stream_id or not text:
+                return EventDecision.SUCCESS, params
+            store = HormoneStateStore(config.core.state_dir)
+            key = store.state_path(stream_id)
+            async with _lock_for(key):
+                data = store.load(stream_id)
+                if not data:
+                    return EventDecision.SUCCESS, params  # 没状态的流不新建
+                system = HormoneSystem(config)
+                system.apply_state(data)
+                system.record_self_turn(text)
+                store.save(stream_id, system.to_state(config.core.state_version))
+        except Exception as exc:  # noqa: BLE001 - 记素材失败不能影响发消息
+            logger.debug(f"记录她自己的发言失败: {exc}")
+        return EventDecision.SUCCESS, params
+
+
 class DreamReviewCommand(BaseCommand):
     """/查看昨晚梦境：只读展示她最近一晚记住的梦与小本本，供用户审计（不主动外泄）。"""
 
@@ -735,7 +819,7 @@ class HormoneSystemPlugin(BasePlugin):
         if isinstance(config, HormoneSystemConfig) and not config.core.enabled:
             logger.info("hormone_system 已在配置中禁用")
             return []
-        return [HormonePromptHandler, DreamReviewCommand]
+        return [HormonePromptHandler, HormoneSentHandler, DreamReviewCommand]
 
     async def on_plugin_loaded(self) -> None:
         """加载后：若开启睡眠整理，等待调度器就绪再注册周期任务。"""

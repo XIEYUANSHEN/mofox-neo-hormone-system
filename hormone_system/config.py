@@ -77,8 +77,8 @@ class HormoneSystemConfig(BaseConfig):
             description="消息历史上限（预留参数，第一版未使用）",
         )
         state_version: int = Field(
-            default=3,
-            description="状态文件版本号",
+            default=4,
+            description="状态文件版本号（v4 起梦料带 who=user/self）",
         )
 
     @config_section("idle_drift")
@@ -198,7 +198,53 @@ class HormoneSystemConfig(BaseConfig):
             default=40,
             ge=5,
             le=100,
-            description="recent_turns 原料缓冲上限",
+            description="recent_turns 原料缓冲上限（旧字段；实际上限取它和 dream_material_max 里的大者）",
+        )
+        dream_material_max: int = Field(
+            default=120,
+            ge=20,
+            le=400,
+            description="梦料条数上限：跨天一起留，梦从这里面抽",
+        )
+        dream_material_days: float = Field(
+            default=2.0,
+            ge=1.0,
+            le=7.0,
+            description="梦料只留最近几天（更早的丢掉）",
+        )
+        dream_context_lines: int = Field(
+            default=1,
+            ge=0,
+            le=2,
+            description="选中一条素材时前后各带几句上下文（0=只留那一句）",
+        )
+        dream_random_picks: int = Field(
+            default=1,
+            ge=0,
+            le=3,
+            description="除按显著性挑的之外再随机抓几条，让梦不是每次都同一批",
+        )
+        dream_conflict_quota: int = Field(
+            default=2,
+            ge=0,
+            le=5,
+            description="最近 24h 内的强负面必须带几条进梦（0=不强制）",
+        )
+        dream_conflict_threshold: float = Field(
+            default=-0.45,
+            ge=-1.0,
+            le=0.0,
+            description="情绪分低于此算「冲突/难受」，用于强制配额和基调下限",
+        )
+        dream_resolve_threshold: float = Field(
+            default=0.6,
+            ge=0.0,
+            le=1.0,
+            description="冲突之后出现不低于此分的正面互动才算「消解」，才允许纯甜梦",
+        )
+        dream_sweet_needs_resolve: bool = Field(
+            default=True,
+            description="有未消解的冲突时压成「甜虐」而不是纯甜（关=只看当下心境）",
         )
         turn_clip_chars: int = Field(
             default=120,

@@ -39,7 +39,7 @@ check("1.1 新字段存在", all(hasattr(c.sleep, k) for k in
        "journal_max_days","top_k","turn_buffer_max","consolidate_timeout_seconds","inject_journal"]))
 check("1.2 consolidate 默认 true", c.sleep.consolidate is True)
 check("1.3 journal 默认 3 / check 默认15", c.sleep.journal_max_days == 3 and c.sleep.dream_check_minutes == 15)
-check("1.4 state_version 默认 3", c.core.state_version == 3)
+check("1.4 state_version 默认 4（梦料带 who）", c.core.state_version == 4)
 
 # ---------- 2. recent_turns 仅 consolidate 时缓冲 ----------
 sys1 = HormoneSystem(cfg_consolidate(True))
@@ -1048,6 +1048,265 @@ finally:
     time.time = _real28
 check("28.4 后台任务在梦窗之外也会清掉并说一句",
       _pd_left is None and len(_pd_note) == 1, f"{_pd_left} {_pd_note}")
+
+# ---------- 29. 梦料机制（双方发言 / 跨天分层 / 冲突配额 / 片段 / 基调下限） ----------
+import types as _types
+
+def _cfg29(**over):
+    c = cfg_consolidate(True)
+    c.core.state_dir = tempfile.mkdtemp(prefix="hormone_mat_")
+    for k, v in over.items():
+        setattr(c.sleep, k, v)
+    return c
+
+def _seed_turns(s, items):
+    """items: [(text, score, hours_ago, who)]；内部按时间正序排（老的在前），跟真实追加顺序一致。"""
+    now = time.time()
+    s.recent_turns = [
+        {"text": t, "score": sc, "ts": now - h * 3600, "who": w}
+        for t, sc, h, w in sorted(items, key=lambda x: -x[2])
+    ]
+
+def _all_text(frags):
+    return " | ".join(f["text"] for f in frags)
+
+# 29.1/29.2 她的话进梦料，片段里双方并列
+c29 = _cfg29()
+s29 = HormoneSystem(c29)
+s29.hormones = {"dopamine": 70.0, "cortisol": 30.0, "oxytocin": 85.0,
+                "serotonin": 70.0, "endorphin": 75.0, "empathy": 60.0}
+s29.emotion_memory = [(0.8, time.time())]
+_seed_turns(s29, [("他说最喜欢你", 0.8, 1, "user")])
+s29.record_self_turn("我一直都在")
+check("29.1 她自己的话能进梦料", s29.recent_turns[-1].get("who") == "self"
+      and s29.recent_turns[-1]["text"] == "我一直都在", s29.recent_turns[-1])
+_frags29, _t29 = s29.get_generation_input()
+check("29.2 片段里双方并列（他：…／我：…）",
+      "他：他说最喜欢你" in _all_text(_frags29) and "我：我一直都在" in _all_text(_frags29),
+      _all_text(_frags29))
+
+# 29.3 上限 120 条 + 只留两天
+c29b = _cfg29()
+s29b = HormoneSystem(c29b)
+now29 = time.time()
+s29b.recent_turns = [
+    {"text": f"m{i}", "score": 0.0, "ts": now29 - i * 60, "who": "user"}
+    for i in range(300)
+]
+s29b.recent_turns.append({"text": "三天前", "score": 0.0, "ts": now29 - 72 * 3600, "who": "user"})
+s29b._push_recent_turn("最新一句", 0.2)
+check("29.3 梦料上限 120 且超过两天被丢",
+      len(s29b.recent_turns) == 120 and "三天前" not in [t["text"] for t in s29b.recent_turns],
+      len(s29b.recent_turns))
+
+# 29.4 冲突配额：最近 24h 的强负面必须入选（哪怕别的分更高）
+c29c = _cfg29(dream_random_picks=0)
+s29c = HormoneSystem(c29c)
+s29c.hormones = {"dopamine": 70.0, "cortisol": 60.0, "oxytocin": 85.0,
+                 "serotonin": 60.0, "endorphin": 70.0, "empathy": 70.0}
+s29c.emotion_memory = [(0.5, time.time())]
+_seed_turns(s29c, [
+    ("今天吵了一架", -0.8, 3, "user"),
+    ("她说她很难受", -0.7, 2, "user"),
+    ("我们吃了很好吃的饭", 0.9, 8, "user"),
+    ("他又逗我笑", 0.9, 9, "user"),
+    ("明天见", 0.2, 1, "user"),
+    ("晚安", 0.1, 0.5, "user"),
+])
+_f29c, _ = s29c.get_generation_input()
+check("29.4 强负面有强制配额", "今天吵了一架" in _all_text(_f29c), _all_text(_f29c))
+
+# 29.5 未消解的冲突 → 压成甜虐，不给纯甜
+check("29.5 吵架没被哄好 → 基调封顶 ambivalent", _ == "ambivalent", _)
+
+# 29.6 被哄好了（之后有 ≥0.6 的正面）→ 允许纯甜
+c29d = _cfg29(dream_random_picks=0)
+s29d = HormoneSystem(c29d)
+s29d.hormones = {"dopamine": 80.0, "cortisol": 30.0, "oxytocin": 85.0,
+                 "serotonin": 75.0, "endorphin": 75.0, "empathy": 65.0}
+s29d.emotion_memory = [(0.8, time.time())]
+_seed_turns(s29d, [
+    ("今天吵了一架", -0.8, 4, "user"),
+    ("后来他好好道歉了，抱了好久", 0.8, 1, "user"),
+])
+_f29d, _t29d = s29d.get_generation_input()
+check("29.6 冲突被消解后可以做甜梦", _t29d == "sweet", _t29d)
+
+# 29.7 时间分层：三个时间段各有一条被带上
+c29e = _cfg29(dream_random_picks=0, top_k=3, dream_context_lines=0)
+s29e = HormoneSystem(c29e)
+s29e.hormones = {"dopamine": 70.0, "cortisol": 30.0, "oxytocin": 60.0,
+                 "serotonin": 70.0, "endorphin": 70.0, "empathy": 60.0}
+_seed_turns(s29e, [
+    ("今晚的高分话", 0.95, 0.5, "user"),   # 第 1 层
+    ("今天下午的话", 0.90, 10, "user"),    # 第 2 层里最显著的
+    ("昨晚的话", 0.10, 20, "user"),        # 第 2 层里不显著的（不该挤掉下午那条）
+    ("昨天的话", 0.10, 30, "user"),        # 第 3 层（纯按分数排它进不了 top3）
+])
+_f29e, _ = s29e.get_generation_input()
+_txt29e = _all_text(_f29e)
+check("29.7 三段时间各有一条入梦（不纯按分数）",
+      "今晚的高分话" in _txt29e and "今天下午的话" in _txt29e
+      and "昨天的话" in _txt29e and "昨晚的话" not in _txt29e,
+      _txt29e)
+
+# 29.8 片段化 + 字数上限
+check("29.8 片段带说话人、整块不超 620 字",
+      all(("他：" in f["text"] or "我：" in f["text"]) for f in _frags29)
+      and sum(len(f["text"]) for f in _frags29) <= 620,
+      sum(len(f["text"]) for f in _frags29))
+
+# 29.9 prompt 里写清了"梦是碎的、不要复述、别只挑甜的"
+check("29.9 梦提示词含三条梦化约束",
+      "不要照抄原句" in hp._DREAM_PROMPT
+      and "不要总结" in hp._DREAM_PROMPT
+      and "不要只挑好的一面" in hp._DREAM_PROMPT)
+
+# 29.10 她的发言通过 on_message_sent 落盘；占位消息不记录；无状态的流不新建
+async def sent_handler_test():
+    c = _cfg29()
+    store = HormoneStateStore(c.core.state_dir)
+    s = HormoneSystem(c)
+    s.hormones = {"dopamine": 50.0, "cortisol": 50.0, "oxytocin": 50.0,
+                  "serotonin": 50.0, "endorphin": 50.0, "empathy": 50.0}
+    store.save("S1", s.to_state(c.core.state_version))
+    inst = hp.HormoneSystemPlugin.__new__(hp.HormoneSystemPlugin)
+    inst.config = c
+    h = hp.HormoneSentHandler.__new__(hp.HormoneSentHandler)
+    h.plugin = inst
+    await h.execute("on_message_sent", {"message": _types.SimpleNamespace(
+        stream_id="S1", processed_plain_text="我一直都在，别怕", content=None)})
+    await h.execute("on_message_sent", {"message": _types.SimpleNamespace(
+        stream_id="S1", processed_plain_text="[表情包(abc):某个表情]", content=None)})
+    await h.execute("on_message_sent", {"message": _types.SimpleNamespace(
+        stream_id="NOPE", processed_plain_text="没有状态文件", content=None)})
+    return store, c
+_store29, _c29 = asyncio.run(sent_handler_test())
+_st29 = _store29.load("S1") or {}
+_turns29 = _st29.get("recent_turns") or []
+check("29.10 发出的文本记成 who=self", len(_turns29) == 1
+      and _turns29[0]["who"] == "self" and "我一直都在" in _turns29[0]["text"], _turns29)
+check("29.11 占位消息不记录、没状态的流不新建",
+      len(_turns29) == 1 and not _store29.load("NOPE"))
+
+# 29.12 老状态没有 who → 视为 user；往返保留 who
+_old = HormoneSystem(_cfg29())
+_old.apply_state({"version": 3, "recent_turns": [{"text": "老数据", "score": 0.3, "ts": time.time()}]})
+check("29.12 旧状态下 who 默认 user", _old.recent_turns[0].get("who") == "user")
+_rt29 = HormoneSystem(_cfg29())
+_rt29.recent_turns = [{"text": "a", "score": 0.0, "ts": time.time(), "who": "self"}]
+_rt29b = HormoneSystem(_cfg29())
+_rt29b.apply_state(_rt29.to_state(4))
+check("29.13 往返保留 self 标记", _rt29b.recent_turns[0].get("who") == "self")
+_trunc = hp._coerce_dream(None, '{"dream":"他摸着我头，却捂住嘴说忘了。我变成一串乱码')
+check("29.14 JSON 被截断也能把梦抠回来",
+      _trunc is not None and "乱码" in _trunc["dream"], _trunc)
+check("29.15 连 dream 字段都没有仍然 None", hp._coerce_dream(None, '{"recall":"clear"}') is None)
+# 29.16 被她自己说过的长回复（截断的）显著性减半
+c29f = _cfg29()
+s29f = HormoneSystem(c29f)
+s29f.record_self_turn("好" * 300)   # 会被截断
+_s29f_turn = s29f.recent_turns[-1]
+check("29.16 截断的她的话显著性减半",
+      _s29f_turn.get("clipped") is True
+      and abs(s29f._turn_salience(_s29f_turn) - 0.15) < 1e-9,
+      (_s29f_turn.get("clipped"), s29f._turn_salience(_s29f_turn)))
+check("29.16b 完整的一句不降权", abs(s29f._turn_salience({"who": "self"}) - 0.30) < 1e-9)
+
+# 29.17 相邻好几条被选中时，片段会被切开（不把一晚吞成一大段）
+c29g = _cfg29(dream_random_picks=0, top_k=5, dream_context_lines=1)
+s29g = HormoneSystem(c29g)
+s29g.hormones = {"dopamine": 70.0, "cortisol": 30.0, "oxytocin": 60.0,
+                 "serotonin": 70.0, "endorphin": 70.0, "empathy": 60.0}
+_seed_turns(s29g, [(f"第{i}句", 0.5, 1 - i * 0.01, "user") for i in range(8)])
+_f29g, _ = s29g.get_generation_input()
+check("29.17 相邻多条 → 切成多个 ≤4 句的片段", len(_f29g) >= 2
+      and all(f["text"].count("／") <= 3 for f in _f29g),
+      [f["text"].count("／") + 1 for f in _f29g])
+
+# ---------- 30. 一晚没睡好 ≠ 连着几天（睡眠债文案） ----------
+c30 = cfg_consolidate(True)
+s30a = HormoneSystem(c30)
+s30a.hormones = {k: 50.0 for k in ("dopamine", "cortisol", "oxytocin",
+                                   "serotonin", "endorphin", "empathy")}
+s30a._state_loaded = True
+s30a._settle_last_sleep(dict(s30a.hormones), 1.0, False, time.time())   # 只睡 1h → short
+check("30.1 短睡记一夜 streak",
+      s30a.last_sleep_kind == "short" and s30a.sleep_short_streak == 1,
+      (s30a.last_sleep_kind, s30a.sleep_short_streak))
+s30a._settle_last_sleep(dict(s30a.hormones), 1.0, False, time.time())   # 再一晚
+check("30.2 连续短睡累加", s30a.sleep_short_streak == 2, s30a.sleep_short_streak)
+s30a._settle_last_sleep(dict(s30a.hormones), 7.0, False, time.time())   # 睡好了 → 归零
+check("30.3 睡够一晚清零", s30a.sleep_short_streak == 0, s30a.sleep_short_streak)
+
+from hormone_system.prompt import _debt_line as _dl30
+s30b = HormoneSystem(c30)
+s30b.sleep_debt = 4.1
+s30b.last_sleep_kind = "short"
+s30b.sleep_short_streak = 1
+_l30 = _dl30(s30b, c30)
+check("30.4 只一晚 → 不说“连着几天”",
+      "连着几天" not in _l30 and "昨晚" in _l30, _l30)
+s30b.sleep_short_streak = 3
+_l30b = _dl30(s30b, c30)
+check("30.5 连着几晚 → 才说“连着几天”", "连着几天" in _l30b, _l30b)
+
+s30c = HormoneSystem(c30)
+s30c.sleep_debt = 4.1
+s30c.last_sleep_kind = "short"
+s30c.sleep_short_streak = 2
+_rt30 = HormoneSystem(c30)
+_rt30.apply_state(s30c.to_state(4))
+check("30.6 streak 能往返落盘", _rt30.sleep_short_streak == 2, _rt30.sleep_short_streak)
+_mig30 = HormoneSystem(c30)
+_mig30.apply_state({"version": 3, "sleep_debt": 4.1, "last_sleep_kind": "short"})
+check("30.7 老状态缺 streak → 按昨晚类型补 1", _mig30.sleep_short_streak == 1,
+      _mig30.sleep_short_streak)
+
+# ---------- 31. 睡眠时长按“累计安静”算（半夜被摸一下头不该作废整夜） ----------
+c31 = cfg_consolidate(True)
+s31 = HormoneSystem(c31)
+_base31 = s31._day_anchor(time.time(), 0.0)
+# 真实那晚：23:15–23:26 上床前聊完，01:39 被摸头，04:56 被亲一口，计划 23:30→06:00
+s31.sleep_awake_spans = [
+    [_base31 + 23.43 * 3600, _base31 + 23.43 * 3600],
+    [_base31 + 25.65 * 3600, _base31 + 25.65 * 3600],
+    [_base31 + 28.93 * 3600, _base31 + 28.93 * 3600],
+]
+_q31 = s31._quiet_slept(_base31 + 22 * 3600, _base31 + 31 * 3600, 23.5, 6.0)
+check("31.1 半夜两次互动不再把整夜作废", 6.0 < _q31 <= 7.05, round(_q31, 2))
+s31.sleep_awake_spans = []
+_q31b = s31._quiet_slept(_base31 + 22 * 3600, _base31 + 31 * 3600, 23.5, 6.0)
+check("31.2 没有记录时与旧口径一致（7h 窗）", abs(_q31b - 7.0) < 0.01, round(_q31b, 2))
+
+# 31.3 连续聊 11 分钟（区间）要扣掉这 11 分钟，而不是当成睡着
+s31b = HormoneSystem(c31)
+s31b.sleep_awake_spans = [[_base31 + 23.25 * 3600, _base31 + 23.43 * 3600]]  # 23:15–23:26
+_q31b2 = s31b._quiet_slept(_base31 + 22 * 3600, _base31 + 31 * 3600, 23.5, 6.0)
+check("31.3 连续聊天的那段被扣掉", 6.5 < _q31b2 < 7.0, round(_q31b2, 2))
+
+# 31.4 通宵聊天：一路记 65 句（超过旧的 60 点上限）→ 合并成一段，只剩最后十几分钟算睡
+s31c = HormoneSystem(c31)
+_t = _base31 + 23.0 * 3600
+while _t < _base31 + 29.83 * 3600:   # 23:00 → 05:50
+    s31c._record_awake(_t)
+    _t += 300
+_q31c = s31c._quiet_slept(_base31 + 22 * 3600, _base31 + 31 * 3600, 23.5, 6.0)
+check("31.4 长聊不被 60 点上限吃掉、也不会被当成睡着",
+      len(s31c.sleep_awake_spans) == 1 and _q31c < 0.3,
+      (len(s31c.sleep_awake_spans), round(_q31c, 2)))
+
+# 31.5 区间能往返落盘；旧的散点字段也能读进来
+s31d = HormoneSystem(c31)
+s31d._record_awake_in_night(_base31 + 25.65 * 3600, 23.5, 6.0)
+_rt31 = HormoneSystem(c31)
+_rt31.apply_state(s31d.to_state(4))
+check("31.5 醒着区间能往返落盘", len(_rt31.sleep_awake_spans) == 1, _rt31.sleep_awake_spans)
+_old31 = HormoneSystem(c31)
+_old31.apply_state({"version": 4, "sleep_awake_ts": [
+    _base31 + 23.4 * 3600, _base31 + 23.42 * 3600, _base31 + 25.0 * 3600]})
+check("31.6 旧散点字段能迁移成区间（相邻<10分钟合并）",
+      len(_old31.sleep_awake_spans) == 2, _old31.sleep_awake_spans)
 
 print("\n==== RESULT ====")
 print("FAILED:", fails if fails else "NONE")
