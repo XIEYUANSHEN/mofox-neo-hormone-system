@@ -153,11 +153,16 @@ def main():
         body["readme_markdown"] = md
         st, res = call("PUT", f"{MARKET}/api/v1/plugins/hormone_system", token, body, accept="application/json")
         ok = isinstance(res, dict) and res.get("plugin_id", "hormone_system") == "hormone_system"
-        print("market readme ->", st, "已刷新" if ok else json.dumps(res, ensure_ascii=False)[:300])
-        st, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
+        st2, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
         html = (rd or {}).get("html", "") if isinstance(rd, dict) else ""
-        print("回读市场页 readme：", st, len(html), "chars |",
-              "已是新版" if "不扣 token" in html and "0.4.3.mfp" in html else "仍是旧版/待审核")
+        fresh = "不扣 token" in html and "0.4.3.mfp" in html
+        if ok:
+            print("market readme -> PUT 200 已刷新")
+        elif fresh:
+            # 实测：内容没变化时再 PUT 会返 500（幂等路径的服务端 bug），所以回读说了算
+            print(f"market readme -> PUT {st}，但回读已是最新内容（{len(html)} chars），按成功处理")
+        else:
+            print(f"market readme -> PUT {st} 失败且内容仍是旧的：{json.dumps(res, ensure_ascii=False)[:200]}")
     elif changed:
         print("dry-run：市场页 README 也没刷，加 --apply。")
 
