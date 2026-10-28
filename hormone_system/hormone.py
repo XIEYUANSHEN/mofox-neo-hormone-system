@@ -1017,17 +1017,22 @@ class HormoneSystem:
             self.sleep_debt = 0.0
             self.sleep_short_streak = 0
 
+        note = ""
         if self.last_sleep_kind == "allnighter":
             self.pending_dream = None  # 通宵不算有梦
         else:
+            had_pending = isinstance(self.pending_dream, dict)
             recall, worth = self._judge_pending_dream(slept, was_interrupted)
-            self._promote_pending_dream(recall, worth)
+            promoted = self._promote_pending_dream(recall, worth)
+            if not promoted:
+                # 把"这一夜没有新梦"说清楚，免得状态里那句"记着…的梦"被当成昨晚做的
+                note = "｜昨晚没做梦" if not had_pending else "｜昨晚的梦没记住"
 
         q_cn = {"good": "良好", "short": "偏短", "bad": "没睡好"}.get(quality, quality)
         logger.info(
             f"[Sleep] 睡了 {slept:.1f}h｜质量{q_cn}（{score}）｜"
             f"被吵醒={'是' if was_interrupted else '否'}｜{self.sleep_state_summary()}｜"
-            f"疲劳 {before_fatigue:.0f}→{self.fatigue:.0f}"
+            f"疲劳 {before_fatigue:.0f}→{self.fatigue:.0f}{note}"
         )
 
     @staticmethod
@@ -1083,13 +1088,38 @@ class HormoneSystem:
             dream_s = "有梦待晨间确认"
         elif isinstance(pd, dict):
             dream_s = "昨晚的梦没等到确认，已经散了"  # 草稿过期（>24h）不会再转正
-        elif isinstance(self.gen_dream, dict):
-            dream_s = "记着昨晚的梦"
         else:
-            dream_s = "没有梦记录"
+            dream_s = self.dream_brief()
 
         q_cn = {"good": "良好", "short": "偏短", "bad": "没睡好"}.get(self.sleep_quality, self.sleep_quality)
         return "｜".join([plan_s, debt_s, nap_s, dream_s, f"睡眠质量{q_cn}（{self.sleep_score}）"])
+
+    def dream_night_date(self) -> str:
+        """最近一场记得的梦属于哪一夜（形如 2026-10-25）；没有/推不出就返回空串。
+
+        只给事实日期，不判断"昨夜还是几夜前"——措辞交给模型（读注入的人话）和看日志的人。
+        """
+        gd = self.gen_dream
+        if not isinstance(gd, dict) or not gd.get("text"):
+            return ""
+        key = str(gd.get("night_key") or "")
+        if not key:
+            # 旧状态没有 night_key：按梦的生成时间反推（夜桶 18:00→次日 12:00）
+            try:
+                key = self._night_key(float(gd.get("ts") or gd.get("gen_ts") or 0.0))
+            except (TypeError, ValueError):
+                return ""
+        return key
+
+    def dream_brief(self) -> str:
+        """状态摘要里那一段：带日期，不做"第几夜前"的换算。"""
+        key = self.dream_night_date()
+        if not key:
+            return "没有梦记录"
+        try:
+            return f"记着 {int(key[5:7])}月{int(key[8:10])}日那晚的梦"
+        except (ValueError, IndexError):
+            return "记着最近那晚的梦"
 
     def _apply_debt_bounds(self) -> None:
         """睡眠债未还清时：抬高皮质醇底线、压低血清素上限（随债下降自动收窄）。"""
@@ -1254,10 +1284,12 @@ class HormoneSystem:
 
     def set_pending_dream(self, dream_text: str, tone: str) -> None:
         """熟睡中段生成梦时先存草稿（内容+基调）；醒来再判定 recall/worth。"""
+        now = time.time()
         self.pending_dream = {
             "text": dream_text,
             "tone": tone,
-            "gen_ts": time.time(),
+            "gen_ts": now,
+            "night_key": self._night_key(now),
         }
         self.recent_turns = []
 
@@ -1301,17 +1333,17 @@ class HormoneSystem:
         )
         return recall, worth
 
-    def _promote_pending_dream(self, recall: str, worth: bool) -> None:
-        """醒来判定后把草稿转正进 gen_dream / 小本本（worth 才记）。"""
+    def _promote_pending_dream(self, recall: str, worth: bool) -> bool:
+        """醒来判定后把草稿转正进 gen_dream / 小本本（worth 才记）；返回是否真的转正。"""
         pd = self.pending_dream
         self.pending_dream = None
         if not isinstance(pd, dict) or not pd.get("text"):
-            return
+            return False
         try:
             if time.time() - float(pd.get("gen_ts", 0.0)) > 24.0 * 3600.0:
-                return  # 太久的草稿丢弃，避免隔夜误转正
+                return False  # 太久的草稿丢弃，避免隔夜误转正
         except (TypeError, ValueError):
-            return
+            return False
         self.gen_dream = dict(pd)
         self.gen_dream["recall"] = recall
         self.gen_dream["worth"] = bool(worth)
@@ -1319,6 +1351,12 @@ class HormoneSystem:
             self.gen_dream["ts"] = float(pd.get("gen_ts", time.time()))
         except (TypeError, ValueError):
             self.gen_dream["ts"] = time.time()
+        # 记下"这场梦属于哪一夜"，状态摘要/命令才能说清是昨晚还是几夜前（旧状态可能没有）
+        if not self.gen_dream.get("night_key"):
+            try:
+                self.gen_dream["night_key"] = self._night_key(float(self.gen_dream["ts"]))
+            except (TypeError, ValueError):
+                pass
         if worth:
             now = time.time()
             self.sleep_journal.append(
@@ -1334,6 +1372,7 @@ class HormoneSystem:
             limit = self._cfg.sleep.journal_max_days
             if len(self.sleep_journal) > limit:
                 self.sleep_journal = self.sleep_journal[-limit:]
+        return True
 
     # ---------- 睡眠记忆整理 / 梦生成辅助 ----------
     def _material_cap(self) -> int:

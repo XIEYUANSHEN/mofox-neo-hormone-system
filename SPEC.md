@@ -69,6 +69,8 @@ plugins/hormone_system/
 
   `version, hormones, last_interaction_time, emotion_memory, recent_gaps, fatigue, topic_history, wake_up_turns, wake_up_reason, last_sleep_time, last_sleep_settle, last_sleep_kind, sleep_score, sleep_quality, sleep_thoughts, sleep_interrupted_at, sleep_debt, sleep_short_streak, sleep_awake_spans, sleep_plan, nap, nap_date, nap_check_ts, recent_turns, pending_dream, gen_dream, sleep_journal`
 
+  0.4.4 起 `pending_dream` / `gen_dream` 多一个 `night_key`（这场梦属于哪一夜，夜桶起始日）；老状态没有就按 `ts` 反推，`dream_night_date()` / `dream_brief()` 是唯一出口。状态里的 `version` 只是写盘标记，`apply_state` 逐字段宽容解析、**不看它**。
+
 - `recent_turns` 每条形如 `{text, score, ts, who, clipped}`；旧状态没有 `who/clipped` 时默认 `user / false`。
 - 多实例 / 多 stream 相互隔离；跨机迁移要注意 `recent_turns` 里的原料文本是本地语料，不含凭据。
 
@@ -106,7 +108,8 @@ plugins/hormone_system/
   - 生成提示词（`_DREAM_PROMPT`）明确：梦是碎的、可换场景/缝在一起；**不要照抄原句、不要把发生过的事按原样讲一遍、不要总结**；素材里有冲突就留着它，不要只挑好的一面。输出 40–70 字。
   - 模型偶尔把 JSON 截断：`_coerce_dream(parsed, raw)` 会从原文里把 `"dream":"…"` 抠出来，不让一夜白丢。
 - **第一刀·熟睡中段生成内容**：`_dream_window_bounds` 求出本夜 `(bed_ts, wake_ts)`，`frac = (now-bed)/(wake-bed)` 落在 `[dream_mid_start_ratio, dream_mid_end_ratio)`（默认 0.3–0.7）才动手；先过三道闸——安静满 onset 阈值（还在聊不做）、本窗口未生成过（`gen_dream.ts` 或 `pending_dream.gen_ts` 早于窗起点才算没做过）、有原料（`recent_turns` Top-`top_k`）。基调由 `_compute_smoothed_aff` + 催产素/皮质醇阈值决定：`nightmare / sweet / ambivalent / neutral`，**噩梦不产内容**，交回阴影路径。
-- **第二刀·醒来确定性判定**：`_judge_pending_dream` 按 `slept` 与 `was_interrupted` 定 `recall`，`worth = recall!=none and (recall=="clear" or tone in (sweet, ambivalent))`；`_promote_pending_dream` 只把 `worth` 的写进 `gen_dream` 与小本本，草稿超过 24h 直接丢弃；通宵（`allnighter`）丢弃草稿。
+- **第二刀·醒来确定性判定**：`_judge_pending_dream` 按 `slept` 与 `was_interrupted` 定 `recall`，`worth = recall!=none and (recall=="clear" or tone in (sweet, ambivalent))`；`_promote_pending_dream` 把草稿转正进 `gen_dream`（补 `night_key`）与小本本（worth 才记，返回是否转正），草稿超过 24h 直接丢弃；通宵（`allnighter`）丢弃草稿。转正失败时 `[Sleep]` 行补「昨晚没做梦 / 昨晚的梦没记住」。
+- **注入措辞（0.4.4）**：不再由代码判断"昨夜/几夜前"，注入里给出梦所属的**日期**（如「10月27日夜里你梦到他了……按这个日期说，别说成刚做的」），让模型自己按时间距离说话；`/睡眠状态`、`/查看昨晚梦境`、小本本一律带日期。
 - 生成成功即清空 `recent_turns`（一夜一个梦）；**模型没成时不清原料**，下一轮继续试。
 
 ## 8. 后台调度与并发
@@ -143,7 +146,7 @@ plugins/hormone_system/
 
 ## 11. 验收标准
 
-- [ ] 实例日志出现 `✅ 插件加载成功: hormone_system v0.4.3` 与 `睡眠后台任务已注册`，并注册 **5 个组件**（2 个 event_handler + 2 条命令 + config；少了 `hormone_sent_handler` 她的话就不进梦料，少了 `睡眠状态` 命令说明加载的还是旧版）
+- [ ] 实例日志出现 `✅ 插件加载成功: hormone_system v0.4.4` 与 `睡眠后台任务已注册`，并注册 **5 个组件**（2 个 event_handler + 2 条命令 + config；少了 `hormone_sent_handler` 她的话就不进梦料，少了 `睡眠状态` 命令说明加载的还是旧版）
 - [ ] `plan_at` 之后 `[Plan]` 落 `sleep_plan`，且 `night_key` 与当前夜一致
 - [ ] 睡前一直聊 → 醒来 `[Sleep]` 的 `被吵醒=否`，睡眠分不被扣
 - [ ] 熟睡中段（默认 01:30–04:15 视作息）出现 `[DreamPend]` 或明确的「今晚不做梦：…」
@@ -152,14 +155,14 @@ plugins/hormone_system/
 - [ ] `/查看昨晚梦境` 能读出她记住的梦；她的回复里没有激素名/数字
 - [ ] `/睡眠状态` 五行都有内容且不贴聊天原文（只报条数/覆盖天数）
 - [ ] 状态文件损坏 → 重置基线，不崩、不影响回复
-- [ ] 单测 **187 条**全绿（仓库根目录 `test_hormone_v030.py`，在实例根目录跑）+ 整夜 mock 端到端（`test_sim_v04_e2e.py`）
+- [ ] 单测 **195 条**全绿（仓库根目录 `test_hormone_v030.py`，在实例根目录跑）+ 整夜 mock 端到端（`test_sim_v04_e2e.py`）
 - [ ] 入梦原料形如 `昵称：正文`，没有 `[消息id:`/`[QQ:`/`[回复<` 残渣；一条 60 字的话能完整进原料
 - [ ] 她自己说的话也进梦料（`who=self`），片段里能看到「我：…」
 - [ ] 最近 24h 吵过、之后没被哄好时，梦的基调不会是纯甜（至少甜虐）
 
 **测试写法约束（踩过）**：断言不得绑真实钟点（23:00 后跑会被"不能定在过去"防呆顺推）；相位/注入类断言要**冻结 `time.time`** 到指定时刻；mock `_generate_*` 时签名要含 `report=None`；**别让随机抖动决定断言分支**——`_score_sleep` 会对激素加抖动，e2e 的 A4 偶尔落成 `quality=bad`（那走潜意识的阴影，本就不该有美梦行），所以 A6 先显式把 quality 设成 `short` 再断言「梦里还留着甜」。
 
-## 12. 配置默认值速查（v0.4.3 实测读回）
+## 12. 配置默认值速查（v0.4.4 实测读回）
 
 `[core]` `enabled=true` `state_dir=data/plugins/hormone_system` `baseline=50` `half_lives={多巴胺12, 皮质醇6, 催产素72, 血清素48, 内啡肽4, 共情24}` `fatigue_half_life=12` `memory_half_life_hours=1` `max_single_emotional_delta=25` `attachment_threshold=80` `memory_window=8` `max_history=40` `state_version=4`
 
@@ -188,6 +191,7 @@ plugins/hormone_system/
 - **v0.4.1**：整理类调用加模型任务候选链与双层时间预算（主回复模型欠费时梦还能做出来）；梦被挡/失败用人话各说一句并节流（键改稳定原因码）；入梦原料剥壳留名（`昵称：正文`，昵称截 12 字；只剩壳的消息不占原料）＋长度改 `turn_clip_chars=120`；注入预算给睡眠段预留位置；收尾期注入她自己定的就寝钟点；`wind_down_hours` 默认 1.5 → 0.5；删「临醒窗口」死代码。
 - **v0.4.1 实盘复盘（2026-10-24 第一夜）**：01:37 主模型 `actor` 失败、`sub_actor` 兜底把两个会话的梦都做出来；醒来结算 7.0h/质量良好、`recall=clear worth=True` 进小本本；樱爱那台 3.3h 被吵醒的夜仍按 `fuzzy+甜` 判成值得记；同夜暴露两个真问题——节流键里带分钟数导致一夜四行、原料 80 字被信封吃掉 63 字只剩 17 字（已修）。
 - **v0.4.2**：重做梦的素材机制——双方发言入料（新增 `on_message_sent` 处理器）、跨两天 120 条、多时间层分层抽样＋随机、片段化并打乱、冲突强制配额与基调下限（未消解的吵架不给纯甜梦）；容忍被截断的模型输出；睡眠时长改按整夜累计安静（`sleep_awake_spans` 区间，<10 分钟间隔算同一段），半夜被吵醒不再作废整夜；内部提示（`<spontaneous_thought>` 等）不再当他说的话；`state_version=4`。实盘复盘（10-26 今昔）：三个会话各出一场梦、主会话基调甜虐；原料 80 条里 59 条 `who=self`；7.1h 的新口径生效。
+- **v0.4.4**：梦带日期——`pending_dream`/`gen_dream` 记 `night_key`，注入写日期、措辞交给模型，代码里删掉"昨夜/前一夜/N 夜前"的换算与阈值；状态摘要/`/睡眠状态` 一律「记着 10月27日那晚的梦」；`/查看昨晚梦境` 带日期、小本本逐条标日期并去掉重复；`[Sleep]` 结算补「昨晚没做梦/没记住」；修「甜甜的的梦」。测试 195 条。起因：10-26 20:53→10-27 07:57 停机一夜，之后旧梦仍被一律说成"昨晚"，看起来像连着三天做同一个梦。
 - **v0.4.3**：新增只读命令 `/睡眠状态`（`SleepStatusCommand._format_status` 五行：作息／相位＋债／补觉＋梦／梦料条数与覆盖天数／上一夜质量，**只报数量不贴原文**）；README 面向社区重写「已知边界与隐私」「三套常见配置」「自检 / 测试」，并修掉两处不实（原写「测试最后会真调一次模型」——实际所有模型调用都被 monkeypatch 成假响应，不联网不扣 token；`/睡眠状态` 曾被记在 0.4.2 名下）。运行逻辑与 0.4.2 相同。**已收录 Neo-MoFox 插件市场**（https://39.96.71.162/plugin/hormone_system ，状态 published）：提交不走浏览器，用 `Bearer <GitHub token>` 打 `POST /api/v1/plugins` ＋ `POST /api/v1/plugins/{id}/versions`（脚本在仓库 `tools/market_submit/submit.py`）；刷新页面上的 README 用 `PUT /api/v1/plugins/{id}` 只传 `readme_markdown`（脚本 `tools/market_submit/push_docs.py`，一次把 README/SPEC/脚本自身推上去并刷新市场页）。`/api/v1/me*` 那套只认浏览器 OAuth 会话，图标/分类得在网页里改。
 
 设计稿（仓库外，维护者机器上）：`睡眠小本本_设计草案`、`睡眠v0.4_自定作息与睡着判定_设计草案`、`睡眠v0.4_代码级实施方案`。

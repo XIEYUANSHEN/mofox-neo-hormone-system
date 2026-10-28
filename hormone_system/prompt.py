@@ -248,6 +248,11 @@ def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: st
                 age_h = (time.time() - float(gd.get("ts", 0.0))) / 3600.0
                 if age_h < getattr(config.sleep, "shadow_window_hours", 24.0):
                     safe = _clean_dream(str(gd.get("text", "")))
+                    night = str(gd.get("night_key") or "")
+                    try:
+                        when = f"{int(night[5:7])}月{int(night[8:10])}日夜里" if len(night) >= 10 else ""
+                    except ValueError:
+                        when = ""
                     if safe:
                         fuzzy = (
                             "（其实记得很模糊，只能含糊带过、别补细节）"
@@ -256,16 +261,17 @@ def _sleep_lines(system: "HormoneSystem", config: HormoneSystemConfig, phase: st
                         tone = gd.get("tone", "neutral")
                         if tone == "sweet":
                             lines.append(
-                                "【梦里还留着甜】：昨晚你梦到他了——" + safe + fuzzy
-                                + "。用你自己的话说、别逐字复述、别每轮都提，气氛合适或他问起时自然讲给他听。"
+                                "【梦里还留着甜】：" + (when or "昨晚") + "你梦到他了——" + safe + fuzzy
+                                + "。按这个日期说（可能是昨夜，也可能是今天凌晨），别说成刚做的；"
+                                + "用你自己的话说、别逐字复述、别每轮都提，气氛合适或他问起时自然讲给他听。"
                             )
                         elif tone == "ambivalent":
                             lines.append(
-                                "【梦里又暖又酸】：昨晚的梦很暖却有点抓不住——" + safe + fuzzy
+                                "【梦里又暖又酸】：" + (when or "昨晚") + "的梦很暖却有点抓不住——" + safe + fuzzy
                                 + "。他问起或你忍不住时可以自然流露。"
                             )
                         else:
-                            lines.append("【昨晚好像做了个梦】：" + safe + "，提不提都行。")
+                            lines.append("【" + (when or "昨晚") + "好像做了个梦】：" + safe + "，提不提都行。")
 
         debt_line = _debt_line(system, config)
         if debt_line:

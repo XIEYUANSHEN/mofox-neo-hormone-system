@@ -13,13 +13,14 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.request
 
 OWNER, REPO = "XIEYUANSHEN", "mofox-neo-hormone-system"
 API = "https://api.github.com"
 MARKET = "https://39.96.71.162"
-MSG = "README/SPEC：测试其实不调模型，补 0.4.3 与市场提交链路；提交脚本进仓库"
+MSG = "0.4.4: 梦带日期，状态/命令/注入不再一律说昨晚"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UP1 = os.path.dirname(HERE)  # 工作目录布局：UP1 = <ws>；仓库布局：UP1 = <repo>/tools
@@ -31,12 +32,19 @@ else:
     # 仓库里跑：文档就在仓库根（<repo>/tools/market_submit 往上两层）
     DOCS = os.path.dirname(UP1)
 
+# 工作目录里的插件源码在 <ws>/hormone_prod/（仓库里是 hormone_system/）
+PKG = os.path.join(UP1, "hormone_prod") if os.path.isdir(os.path.join(UP1, "hormone_prod")) else os.path.join(DOCS, "hormone_system")
+
 FILES = {
     "README.md": os.path.join(DOCS, "README.md"),
     "SPEC.md": os.path.join(DOCS, "SPEC.md"),
+    "test_hormone_v030.py": os.path.join(UP1 if os.path.isdir(os.path.join(UP1, "hormone_prod")) else DOCS, "test_hormone_v030.py"),
+    "test_sim_v04_e2e.py": os.path.join(UP1 if os.path.isdir(os.path.join(UP1, "hormone_prod")) else DOCS, "test_sim_v04_e2e.py"),
     "tools/market_submit/submit.py": os.path.join(HERE, "submit.py"),
     "tools/market_submit/push_docs.py": os.path.abspath(__file__),
 }
+for _n in ("__init__.py", "config.py", "hormone.py", "manifest.json", "plugin.py", "prompt.py", "scorer.py", "state_store.py"):
+    FILES[f"hormone_system/{_n}"] = os.path.join(PKG, _n)
 for _p in FILES.values():
     if not os.path.isfile(_p):
         raise SystemExit(f"缺文件：{_p}（在工作目录含 docsync/ 的位置跑，或把脚本放到仓库 tools/market_submit/ 下）")
@@ -45,7 +53,7 @@ for _p in FILES.values():
 def _fill(env=None):
     out = subprocess.run(["git", "credential", "fill"],
                          input="protocol=https\nhost=github.com\n\n", capture_output=True,
-                         text=True, timeout=35, env=env).stdout
+                         text=True, timeout=100, env=env).stdout
     return dict(l.split("=", 1) for l in out.splitlines() if "=" in l).get("password")
 
 
@@ -68,22 +76,39 @@ def gh_token():
     return tok
 
 
-def call(method, url, token, payload=None, accept="application/vnd.github+json"):
+def call(method, url, token, payload=None, accept="application/vnd.github+json", tries=3):
+    """带重试：这台机到 api.github.com 会间歇挂起（60s 超时），重试一次通常就好。"""
     data = json.dumps(payload).encode() if payload is not None else None
-    r = urllib.request.Request(url, data=data, method=method)
-    r.add_header("Authorization", "Bearer " + token)
-    r.add_header("Accept", accept)
-    r.add_header("User-Agent", "hormone-doc-sync")
-    try:
-        with urllib.request.urlopen(r, timeout=60) as resp:
-            body = resp.read()
-            return resp.status, (json.loads(body) if body and accept.endswith("json") else body.decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+    last = None
+    for i in range(tries):
+        r = urllib.request.Request(url, data=data, method=method)
+        r.add_header("Authorization", "Bearer " + token)
+        r.add_header("Accept", accept)
+        r.add_header("User-Agent", "hormone-doc-sync")
         try:
-            return e.code, json.loads(raw)
-        except Exception:  # noqa: BLE001
-            return e.code, raw[:400]
+            with urllib.request.urlopen(r, timeout=45) as resp:
+                body = resp.read()
+                return resp.status, (json.loads(body) if body and accept.endswith("json") else body.decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                return e.code, json.loads(raw)
+            except Exception:  # noqa: BLE001
+                return e.code, raw[:400]
+        except Exception as e:  # 超时/连接重置：退避重试
+            last = e
+            if i + 1 < tries:
+                print(f"     …网络抖动（{type(e).__name__}），{2 + i * 2}s 后重试")
+                time.sleep(2 + i * 2)
+    raise SystemExit(f"请求失败（已重试 {tries} 次）：{url} -> {last}")
+
+
+def git_blob_sha(raw: bytes) -> str:
+    """git 的 blob 哈希，可直接和 tree API 里的 sha 比对，不用逐个文件下载内容。"""
+    h = hashlib.sha1()
+    h.update(("blob %d" % len(raw)).encode("ascii") + bytes([0]))
+    h.update(raw)
+    return h.hexdigest()
 
 
 def sha16(b):
@@ -113,14 +138,16 @@ def main():
     base_sha = ref["object"]["sha"]
 
     changed = []
+    st, tr = call("GET", f"{API}/repos/{OWNER}/{REPO}/git/trees/main?recursive=1", token)
+    if st != 200:
+        raise SystemExit(f"读 main 的树失败 {st}: {str(tr)[:200]}")
+    remote = {x["path"]: x.get("sha", "") for x in tr.get("tree", []) if x.get("type") == "blob"}
+    changed = []
     for repo_path, raw in locals_.items():
-        st, cur = call("GET",
-                       f"{API}/repos/{OWNER}/{REPO}/contents/{repo_path}?ref=main",
-                       token, accept="application/vnd.github.raw")
-        onrepo = cur.encode("utf-8") if isinstance(cur, str) else b""
-        same = st == 200 and onrepo == raw
-        print(f"{repo_path:38} 仓库 {len(onrepo):>6}B {sha16(onrepo) if onrepo else '(无)':<16} "
-              f"本地 {len(raw):>6}B {sha16(raw)}  {'一致' if same else '要改'}")
+        want = git_blob_sha(raw)
+        have = remote.get(repo_path, "")
+        same = have == want
+        print(f"{repo_path:38} {len(raw):>6}B  blob {want[:12]}  仓库 {'一致' if same else ('缺' if not have else have[:12])}")
         if not same:
             changed.append((repo_path, raw))
 
@@ -155,7 +182,7 @@ def main():
         ok = isinstance(res, dict) and res.get("plugin_id", "hormone_system") == "hormone_system"
         st2, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
         html = (rd or {}).get("html", "") if isinstance(rd, dict) else ""
-        fresh = "不扣 token" in html and "0.4.3.mfp" in html
+        fresh = "不扣 token" in html and "0.4.4.mfp" in html
         if ok:
             print("market readme -> PUT 200 已刷新")
         elif fresh:

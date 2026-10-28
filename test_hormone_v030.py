@@ -1331,7 +1331,7 @@ s33.recent_turns = [
 _st33 = hp.SleepStatusCommand._format_status(s33, c33, _now33)
 check("33.1 概览含作息/债/梦/梦料",
       "23:40 睡" in _st33 and "睡眠债 2.5h" in _st33
-      and "记着昨晚的梦" in _st33 and "梦料 3 条（他 1 / 我 2）" in _st33,
+      and "那晚的梦" in _st33 and "梦料 3 条（他 1 / 我 2）" in _st33,
       _st33)
 check("33.2 连续短睡超过两晚才提" , "连续短睡 2 晚" in _st33, _st33)
 s33.sleep_short_streak = 1
@@ -1356,6 +1356,54 @@ async def _cmd33():
 _ok33, _txt33 = asyncio.run(_cmd33())
 check("33.5 无状态时不抛错、给一句人话", _ok33 is True and "作息记录" in _txt33, _txt33)
 
+# ===== 34. 梦带日期（0.4.4）：只给事实日期，措辞交给模型 =====
+c34 = cfg_consolidate(True)
+s34 = HormoneSystem(c34)
+
+
+def _dream(night_key, text="梦见碗架上的水汽还没散", tone="sweet", recall="fuzzy", ts=None):
+    return {"text": text, "tone": tone, "recall": recall, "worth": True,
+            "ts": ts if ts is not None else time.time(), "night_key": night_key}
+
+
+s34.gen_dream = _dream("2026-10-25")
+check("34.1 状态摘要带日期", s34.dream_night_date() == "2026-10-25"
+      and s34.dream_brief() == "记着 10月25日那晚的梦", s34.dream_brief())
+_st34 = hp.SleepStatusCommand._format_status(s34, c34, time.time())
+check("34.2 /睡眠状态 用日期而不是一律「昨晚」",
+      "10月25日那晚的梦" in _st34 and "记着昨晚的梦" not in _st34, _st34)
+
+# 旧状态没有 night_key：按 ts 反推。夜桶 18:00→次日 12:00，10-27 凌晨 02:00 属于 10-26 那一夜
+s34.gen_dream = {"text": "梦见旧格式", "tone": "sweet", "recall": "fuzzy", "worth": True,
+                 "ts": _dtm.datetime(2026, 10, 27, 2, 0, tzinfo=_ZI("Asia/Shanghai")).timestamp()}
+check("34.3 旧状态无 night_key 时按 ts 反推所属夜", s34.dream_night_date() == "2026-10-26",
+      s34.dream_night_date())
+
+s34.gen_dream = None
+check("34.4 没梦时不编造", s34.dream_night_date() == "" and s34.dream_brief() == "没有梦记录",
+      s34.dream_brief())
+
+# 命令：标签带日期、小本本带日期、同一条梦不重复
+s34.gen_dream = _dream("2026-10-25", text="碗架上的水汽还没散")
+s34.sleep_journal = [
+    {"date": "2026-10-26", "text": "碗架上的水汽还没散", "tone": "sweet", "recall": "fuzzy"},
+    {"date": "2026-10-26", "text": "另一场旧梦", "tone": "sweet", "recall": "clear"},
+]
+_txt34 = hp.DreamReviewCommand._format(s34)
+check("34.5 /查看昨晚梦境 标签与日期都对",
+      "10月25日那晚的梦" in _txt34 and "10月26日：另一场旧梦" in _txt34, _txt34)
+check("34.6 同一条梦不在小本本里重复念", _txt34.count("碗架上的水汽还没散") == 1, _txt34)
+
+# 注入：<24h 时把日期写进提示词，让模型自己按时间说
+c34b = cfg_consolidate(True)
+s34b = HormoneSystem(c34b)
+s34b.gen_dream = _dream("2026-10-27", text="梦见碗架上的水汽")
+_p34 = build_mood_prompt(s34b, c34b)
+check("34.7 注入里带日期，不说死「昨晚」",
+      "10月27日夜里" in _p34 and "梦里还留着甜" in _p34, _p34[:400])
+s34b.gen_dream = _dream("2026-10-27", text="梦见碗架上的水汽", ts=time.time() - 25 * 3600)
+_p34b = build_mood_prompt(s34b, c34b)
+check("34.8 超过 24h 的梦不再注入", "梦里还留着甜" not in _p34b, _p34b[:300])
 print("\n==== RESULT ====")
 print("FAILED:", fails if fails else "NONE")
 sys.exit(1 if fails else 0)

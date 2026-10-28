@@ -13,7 +13,7 @@ MARKET = "https://39.96.71.162"
 HERE = os.path.dirname(os.path.abspath(__file__))
 UP1 = os.path.dirname(HERE)  # 工作目录布局：UP1 = <ws>；仓库布局：UP1 = <repo>/tools
 DOCS = os.path.join(UP1, "docsync") if os.path.isfile(os.path.join(UP1, "docsync", "README.md")) else os.path.dirname(UP1)
-def find_asset(name="hormone_system-0.4.3.mfp"):
+def find_asset(name="hormone_system-0.4.4.mfp"):
     """.mfp 不在仓库里（.gitignore 掉了 dist/*.mfp），所以按几个常见位置找，或用 HORMONE_MFP 指定。"""
     cands = [os.environ.get("HORMONE_MFP"),
              os.path.join(UP1, name), os.path.join(os.path.dirname(UP1), "dist", name),
@@ -95,7 +95,7 @@ def main():
             "六激素状态机 + 睡眠节律。情绪按半衰期回归基线并调制注入 prompt（只给自然语言，不出现数字与激素名）；"
             "睡眠层全自动：睡前收尾、按安静时长判定是否被吵醒、整夜累计安静算睡眠时长、睡眠债与连续短睡、白天自己决定补觉、"
             "熟睡中段用双方近两天的发言做梦料生成梦、醒来按规则判定记不记得/值不值得记进小本本。"
-            "v0.4.3 另有只读命令 /睡眠状态 与 README 的「已知边界与隐私」一节。"
+            "v0.4.4 起梦带日期（哪天夜里做的写在注入里，措辞交给模型，不再一律当「昨晚」）；另有只读命令 /睡眠状态 与 README 的「已知边界与隐私」一节。"
             "依赖 kokoro_flow_chatter（KFC）。"
         ),
         "homepage": REPO,
@@ -108,12 +108,12 @@ def main():
         "readme_markdown": readme,
     }
     version = {
-        "version": "0.4.3",
-        "release_tag": "v0.4.3",
-        "release_title": "hormone_system 0.4.3",
-        "release_url": f"{REPO}/releases/tag/v0.4.3",
-        "asset_name": "hormone_system-0.4.3.mfp",
-        "asset_download_url": f"{REPO}/releases/download/v0.4.3/hormone_system-0.4.3.mfp",
+        "version": "0.4.4",
+        "release_tag": "v0.4.4",
+        "release_title": "hormone_system 0.4.4",
+        "release_url": f"{REPO}/releases/tag/v0.4.4",
+        "asset_name": "hormone_system-0.4.4.mfp",
+        "asset_download_url": f"{REPO}/releases/download/v0.4.4/hormone_system-0.4.4.mfp",
         "checksum_sha256": sha,
         "file_size": len(data),
         "is_prerelease": False,

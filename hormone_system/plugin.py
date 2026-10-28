@@ -735,26 +735,46 @@ class DreamReviewCommand(BaseCommand):
 
     @staticmethod
     def _format(system: HormoneSystem) -> str:
-        """把 gen_dream / 噩梦阴影 / 小本本 拼成一段可读文本。"""
+        """把 gen_dream / 噩梦阴影 / 小本本 拼成一段可读文本。
+
+        0.4.4 起带日期与夜龄：旧版把 gen_dream 一律说成「昨晚」，前几夜的梦会被读成天天做同一个；
+        小本本里同一条梦也不再重复念第二遍。
+        """
         parts: list[str] = []
         gd = system.gen_dream
-        if isinstance(gd, dict) and gd.get("text"):
+        gd_text = ""
+        if isinstance(gd, dict) and gd.get("text") and gd.get("recall") != "none":
+            gd_text = str(gd.get("text", ""))
             tone_label = {
-                "sweet": "甜甜的", "ambivalent": "又暖又酸", "neutral": "有点模糊",
+                "sweet": "很甜", "ambivalent": "又暖又酸", "neutral": "有点模糊",
             }.get(str(gd.get("tone", "neutral")), "有点模糊")
             recall = gd.get("recall", "fuzzy")
+            night = system.dream_night_date() if hasattr(system, "dream_night_date") else ""
+            try:
+                label = f"{int(night[5:7])}月{int(night[8:10])}日那晚" if night else "最近那晚"
+            except (ValueError, IndexError):
+                label = "最近那晚"
             if recall == "fuzzy":
-                parts.append(f"（其实记得很模糊了）好像做了个{tone_label}的梦：{gd.get('text', '')}")
-            elif recall != "none":
-                parts.append(f"昨晚记得比较清楚——{gd.get('text', '')}")
+                parts.append(f"（{label}的梦，其实记得很模糊了）好像做了个{tone_label}的梦：{gd_text}")
+            else:
+                parts.append(f"{label}记得比较清楚——{gd_text}")
         if system.sleep_quality == "bad" and system.sleep_thoughts:
             parts.append(f"（心底还压着一点影子：{system.sleep_thoughts}）")
         if system.sleep_journal:
-            hist = "；".join(
-                j.get("text", "") for j in system.sleep_journal if isinstance(j, dict) and j.get("text")
-            )
-            if hist:
-                parts.append(f"最近记着的：{hist}")
+            items: list[str] = []
+            for j in system.sleep_journal:
+                if not isinstance(j, dict) or not j.get("text"):
+                    continue
+                if gd_text and str(j.get("text")) == gd_text:
+                    continue  # 同一条梦上面已经讲过，别再念一遍
+                day = str(j.get("date") or "")
+                try:
+                    day = f"{int(day[5:7])}月{int(day[8:10])}日" if day else ""
+                except (ValueError, IndexError):
+                    pass
+                items.append(f"{day}：{j['text']}" if day else str(j["text"]))
+            if items:
+                parts.append("最近记着的：" + "；".join(items))
         if not parts:
             return "（翻了翻小本本）……昨晚好像没记下什么。"
         return "\n".join(parts)
@@ -827,13 +847,12 @@ class SleepStatusCommand(BaseCommand):
             nap_s = "没在补觉"
 
         pd = getattr(system, "pending_dream", None)
-        gd = getattr(system, "gen_dream", None)
         if isinstance(pd, dict):
             dream_s = "熟睡里做过一个梦，等醒来判定记不记得"
-        elif isinstance(gd, dict) and gd.get("text"):
-            dream_s = "记着昨晚的梦"
         else:
-            dream_s = "暂时没有梦"
+            # 0.4.4：说清这梦是昨夜的还是几夜前的（旧版一律写"记着昨晚的梦"，会把旧梦说成新梦）
+            brief = system.dream_brief() if hasattr(system, "dream_brief") else ""
+            dream_s = "暂时没有梦" if brief in ("", "没有梦记录") else brief
 
         turns = getattr(system, "recent_turns", []) or []
         mine = sum(1 for t in turns if str(t.get("who", "user")) == "self")
