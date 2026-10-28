@@ -171,27 +171,20 @@ def main():
 
     if args.apply:
         md = locals_["README.md"].decode("utf-8")
-        # 坑：PUT 只传 readme_markdown 会让服务端 500，必须带完整字段（先读回当前记录再合并）
-        st, cur = call("GET", f"{MARKET}/api/v1/plugins/{'hormone_system'}", token, accept="application/json")
-        cur = cur if isinstance(cur, dict) else {}
-        body = {k: cur.get(k) for k in ("display_name", "summary", "description", "homepage",
-                                        "repository_url", "license", "categories", "tags", "maintainers")}
-        body["plugin_dependencies"] = cur.get("plugin_dependencies") or ["kokoro_flow_chatter"]
-        body["readme_markdown"] = md
-        st, res = call("PUT", f"{MARKET}/api/v1/plugins/hormone_system", token, body, accept="application/json")
-        ok = isinstance(res, dict) and res.get("plugin_id", "hormone_system") == "hormone_system"
-        st2, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
+        # 实测：只传 readme_markdown 最稳（带全量字段反而偶发 500）；500 时重试一次，最终以回读为准
+        for attempt in (1, 2):
+            st, res = call("PUT", f"{MARKET}/api/v1/plugins/hormone_system", token,
+                           {"readme_markdown": md}, accept="application/json")
+            ok = isinstance(res, dict) and res.get("plugin_id", "hormone_system") == "hormone_system"
+            if ok:
+                print("market readme -> PUT 200 已刷新")
+                break
+            print(f"market readme -> PUT {st}{'，重试一次' if attempt == 1 else ''}")
+            time.sleep(5)
+        st, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
         html = (rd or {}).get("html", "") if isinstance(rd, dict) else ""
         fresh = "不扣 token" in html and "0.4.4.mfp" in html
-        if ok:
-            print("market readme -> PUT 200 已刷新")
-        elif fresh:
-            # 实测：内容没变化时再 PUT 会返 500（幂等路径的服务端 bug），所以回读说了算
-            print(f"market readme -> PUT {st}，但回读已是最新内容（{len(html)} chars），按成功处理")
-        else:
-            print(f"market readme -> PUT {st} 失败且内容仍是旧的：{json.dumps(res, ensure_ascii=False)[:200]}")
-    elif changed:
-        print("dry-run：市场页 README 也没刷，加 --apply。")
+        print(f"回读市场页 readme：{len(html)} chars｜" + ("已是新版 ✓" if fresh else "仍是旧版，需要人工看一眼"))
 
 
 if __name__ == "__main__":
