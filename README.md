@@ -42,6 +42,7 @@
 - **双方入料**：他说的、她自己说的都记（她的话来自 `on_message_sent`，只记纯文本，表情/图片/语音这些占位消息跳过；KFC 的主动发言/自发思考是内部提示，**不算他的话**）；单条按 `turn_clip_chars` 截，被截断的长回复（多半是解释话）显著性减半，少进梦。
 - **多时间层 + 随机**：原料最多 `dream_material_max=120` 条 / `dream_material_days=2` 天；抽样时「今晚 / 今天早些 / 更早」三层各取最显著的一条，剩下按显著性补齐，再随机抓 `dream_random_picks` 条换掉最弱的——梦不会每次都长在同一段对话上。
 - **片段 + 打乱**：每条选中素材带前后各一句上下文，拼成「他：…／我：…」的片段，片段之间**打乱顺序**（梦不按时间走）；整块素材不超过 620 字。
+- **三道防止梦同质化的闸**：① 她自己的话最多带 `dream_self_max=2` 条（素材里九成都可能是她说的话，不设限梦就变成她语气的复述）；② 「关于梦的话」按 `dream_talk_penalty` 降权，切断"天天聊梦→天天梦到梦"的自反馈；③ 把最近 `dream_avoid_nights=2` 夜做过的梦附进请求，明确要求别再重复那些画面与句式。
 - **冲突不能被旧甜料抹平**：最近 24 小时若有情绪分 ≤ `dream_conflict_threshold` 的强负面，必须带 `dream_conflict_quota` 条进梦；在那之后没有同等强度的正面互动（`dream_resolve_threshold`）就算"没消解"，基调**封顶到甜虐**，不给纯甜；负面压到噩梦阈值时仍然走「潜意识的阴影」，不产梦内容。
 - **提示词层面**：明确"梦是碎的、可以换场景/缝在一起，不要照抄原句、不要把发生过的事按原样讲一遍、不要总结；素材里有冲突就留着它"。
 
@@ -49,7 +50,7 @@
 
 梦 / 作息 / 补觉这三类后台调用默认跟随角色对话模型（`actor`）。主模型欠费或限流时，它们原本会一起静默消失，所以 0.4.1 起：
 
-- **模型任务候选链**：`consolidate_model_task`（留空则从 `actor` 起）→ `actor` → `sub_actor` → `utils_small` → `utils`，前面的没成就换下一个；换用时日志说一句 `[Model] hormone_dream 换用备用模型任务 utils_small（前面 actor 没成）`。
+- **模型任务候选链**：默认从 **`utils`** 起 → `utils_small` → `sub_actor` → `actor`（`consolidate_model_task`/`model_task` 点名哪个就哪个优先，留空也从 `utils` 起），前面的没成就换下一个；换用时日志说一句 `[Model] hormone_dream 换用备用模型任务 utils_small（前面 utils 没成）`。**主回复模型 actor 排在最后**：0.4.6 之前每条消息的打分与每晚的梦/作息都记在主回额度上，那是失误——8B 级就做得好；只有整条链都不通才会碰 actor，且会说一句警告。
 - **两层时间预算**：单个任务最多等 `consolidate_timeout_seconds`（默认 25s），整条链共享 `consolidate_total_seconds`（默认 60s），到点就跳过这一轮——后台整理绝不拖成长任务。
 - **入梦原料先剥壳再截**：KFC 转发的 `[新消息]》时间》[QQ:号] 昵称 [消息id:…]：` 会压成「昵称：正文」，引用回复的嵌套壳也剥掉——**昵称必须留**（梦是第一人称写的，模型得知道这些事是跟谁发生的）；每条按 `turn_clip_chars`（默认 120，约一到两句完整的话）截。只剥壳不剥名，是"梦里还认得他"的前提。
 - **失败必须看得见**：在窗但被挡（还在聊 / 今天没留下能入梦的事 / 压成噩梦走阴影 / 今晚已经做过）与「模型没成」各用一行中文说清原因，**同一晚同一原因只说一句**；梦做成了是 `[DreamPend]`，醒来判定后是 `[Sleep]`。
@@ -60,7 +61,7 @@
 
 - 插件市场：在 Neo-MoFox 的插件管理里搜 `hormone_system`（或访问市场页 <https://39.96.71.162/plugin/hormone_system>），装完仍需重启实例；
 - 把 `hormone_system/` 整个目录放进运行实例的 `plugins/`（源码仓库里就是这个目录）；
-- 或投放打包好的 `hormone_system-0.4.4.mfp`（8 个文件平铺在压缩包根目录，框架按 archive 安装）。
+- 或投放打包好的 `hormone_system-0.4.6.mfp`（8 个文件平铺在压缩包根目录，框架按 archive 安装）。
 
 **改完必须重启实例才生效**——插件与配置都在启动时加载。首次加载会按当时的默认值生成 `config/plugins/hormone_system/config.toml`，此后**升级插件里的默认值不会覆盖已生成的配置**，要改就直接改那个 toml。卸载：删掉 `plugins/hormone_system*`，她的状态与梦料留在 `data/plugins/hormone_system/<stream>.json`，想连记录一起清就删这个目录。
 
@@ -84,7 +85,7 @@ sleep_debt_cap_hours = 12.0    # 债的上限
 debt_decay_per_night = 0.8     # 睡够一晚自然消掉多少债
 oversleep_margin_hours = 2.5   # 比 target 多睡这么多算「睡懵」
 consolidate = true             # 梦/小本本总开关（关=不注册调度、不调模型）
-consolidate_model_task = ""    # 留空 = 从 actor 起走备用任务链
+consolidate_model_task = "utils"  # 默认 utils（通常 8B 级）；留空也从 utils 起，actor 只作最后兜底
 consolidate_timeout_seconds = 25.0   # 单个任务一次的上限
 consolidate_total_seconds = 60.0     # 整条链的总预算
 dream_mid_start_ratio = 0.3    # 睡眠窗 30% 之后开始生成梦
@@ -97,6 +98,9 @@ dream_material_days = 2.0      # 梦料只留最近几天
 top_k = 5                      # 一次做梦取几条原料
 dream_context_lines = 1        # 每条素材前后各带几句上下文
 dream_random_picks = 1         # 再随机抓几条，避免每次都同一批
+dream_self_max = 2             # 一次做梦最多带几条「她自己说的话」（设成 top_k 以上=不限制）
+dream_talk_penalty = 0.35      # 「关于梦的话」再入梦的显著性折扣（0=完全不入梦，1=不降权）
+dream_avoid_nights = 2         # 把最近几夜做过的梦交给模型，要求避开这些意象（0=不给）
 dream_conflict_quota = 2       # 最近 24h 的强负面必须带几条进梦
 dream_conflict_threshold = -0.45  # 低于此分算冲突
 dream_resolve_threshold = 0.6  # 冲突后有多强的正面才算"消解"
@@ -157,6 +161,18 @@ target_sleep_hours = 6.0
 nap_enabled = true
 ```
 
+`[score]` 节（每条消息都会用到，默认值即推荐值）：
+
+```toml
+[score]
+enabled = true
+model_task = "utils"        # 打分用的模型任务；默认 utils，不占主回复额度
+temperature = 0.2           # 打分要可复现，插件自带低温度（只作用于自己的调用）
+override_temperature = true # 关掉 = 沿用 model.toml 里各模型自己配的 temperature
+timeout_seconds = 8.0       # 整条候选链共享这份预算，单任务最多用一半，超时回退词典打分
+max_input_chars = 600
+```
+
 **C. 只做梦，不记账（不要睡眠债、不想让它压激素底线）**
 
 ```toml
@@ -171,7 +187,7 @@ consolidate = true           # 梦和小本本照常
 
 两个测试脚本**不联网、不调模型、不写你的实例数据**，只想确认"这版在我这套框架上没跑歪"的话可以直接跑：
 
-- `test_hormone_v030.py` — 195 条断言（配置默认值、睡着判定、睡眠债分类、梦窗、状态往返、模型任务兜底链、日志节流、原料剥壳与注入预算、梦料分层与冲突配额、她的话入料、`/睡眠状态` 渲染、梦的日期标签）；
+- `test_hormone_v030.py` — 224 条断言（配置默认值、睡着判定、睡眠债分类、梦窗、状态往返、模型任务兜底链、日志节流、原料剥壳与注入预算、梦料分层与冲突配额、她的话入料、`/睡眠状态` 渲染、梦的日期标签）；
 - `test_sim_v04_e2e.py` — 11 条整夜 mock 端到端（定作息 → 睡前聊不算吵醒 → 熟睡中段做梦 → 醒来结算转正 → 通宵记债丢梦 → 白天主动补觉被吵醒）。
 
 脚本在**仓库根目录**，`.mfp` 包里没有（包里只有 8 个运行时文件），从市场装的先 `git clone` 仓库再跑：
@@ -197,10 +213,12 @@ cd <实例目录>
 
 - 框架：Neo-MoFox **1.3.0-alpha.0**（`stream_api` 2.0 / `event_api` 1.0），`manifest.json` 声明依赖 `kokoro_flow_chatter`（KFC），`min_core_version = 1.3.0-alpha.0`（市场收录的兼容下限与此一致）。
 - **Python 3.11**（我们只在 3.11 上实测过；代码只用标准库，含 `zoneinfo`）。纯标准库，无第三方依赖；模型调用只走框架 `llm_api`。
-- 打分与整理默认跟随角色对话模型，可在 `[score] model_task` / `[sleep] consolidate_model_task` 指定独立任务。
+- 打分与整理默认走 `model_tasks.utils`（0.4.6 起，不再跟随主回复模型），可在 `[score] model_task` / `[sleep] consolidate_model_task` 指定别的任务。
 
 ## 版本
 
+- **0.4.6**：**打分与整理不再占主回复额度**。候选链从「actor 起」改成「**utils 起**」（`utils → utils_small → sub_actor → actor`），`[score] model_task`、`[sleep] consolidate_model_task` 默认值改成 `utils`（**老配置里留空 `""` 也自动走新链**，不用手改文件）；打分请求自带 `temperature = 0.2`（复制 model set 覆盖，不回写 `model.toml`，可用 `override_temperature = false` 关掉）；`[score] timeout_seconds` 改为整链共享且单任务最多一半——实测远程 8B 一次抖到 8.0s 会把兜底一起废掉；退到 `actor/sub_actor` 时每天说一句警告。服务端实测：打分中位 1.0–2.5s、`utils` 一次即成、模型条目原温度 0.7 未被改动。测试 224 条。（下面 0.4.5 的改动未单独发版，随本版一起出。）
+- **0.4.5**：**治"梦太像"**。抽样时限制她自己的话占比（`dream_self_max`，素材 9 成是她的话时梦会变成她语气的复述）；「关于梦的话」显著性打折（`dream_talk_penalty`，切断聊梦→梦梦的自反馈）；把最近两夜做过的梦附进生成请求并要求避开重复意象（`dream_avoid_nights`）；`dream_random_picks` 上限 3→5。测试 206 条。
 - **0.4.4**：**梦带日期**。`pending_dream` / `gen_dream` 记下这场梦属于哪一夜（`night_key`，夜桶 18:00→次日 12:00；老状态按 `ts` 反推），注入直接写「10月27日夜里你梦到他了……按这个日期说，别说成刚做的」——**措辞交给模型，代码不再判断"昨夜还是几夜前"**；状态摘要与 `/睡眠状态` 改成「记着 10月27日那晚的梦」；`/查看昨晚梦境` 带日期、小本本逐条标日期，同一条梦不再重复念；`[Sleep]` 结算在那一夜没梦/没记住时补一句「昨晚没做梦」/「昨晚的梦没记住」。顺带修掉「做了个甜甜的的梦」。测试 195 条。
 - **0.4.3**：新增只读命令 `/睡眠状态`（作息/相位/债/补觉/梦/梦料条数，只报数量与状态、不贴聊天原文）；README 补「已知边界与隐私」「三套常见配置」与上面这节自检说明。运行逻辑与 0.4.2 相同。
 - **0.4.2**：重做梦的素材机制——双方发言都入料、跨两天、多时间层分层抽样＋随机、片段化并打乱顺序、冲突强制配额与基调下限（吵架没被哄好就不给纯甜梦）；顺带容忍被截断的模型输出；睡眠时长改按整夜累计安静（半夜被吵醒不再把整夜算成没睡）；内部提示不再当他说的话。

@@ -20,7 +20,7 @@ import urllib.request
 OWNER, REPO = "XIEYUANSHEN", "mofox-neo-hormone-system"
 API = "https://api.github.com"
 MARKET = "https://39.96.71.162"
-MSG = "0.4.4: 梦带日期，状态/命令/注入不再一律说昨晚"
+MSG = "0.4.6: 打分/整理默认走 utils 不占主回额度；temp 0.2；预算按任务分配；修非法日期标签"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UP1 = os.path.dirname(HERE)  # 工作目录布局：UP1 = <ws>；仓库布局：UP1 = <repo>/tools

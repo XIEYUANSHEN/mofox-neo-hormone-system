@@ -31,7 +31,7 @@ from src.app.plugin_system.base import (
 from src.app.plugin_system.api.event_api import EventDecision
 
 from .config import HormoneSystemConfig
-from .hormone import INTERNAL_MARKERS, HormoneSystem
+from .hormone import INTERNAL_MARKERS, HormoneSystem, date_cn, night_cn
 from .prompt import build_mood_prompt
 from .state_store import HormoneStateStore
 
@@ -208,20 +208,33 @@ def _coerce_dream(parsed: dict | None, raw: str | None = None) -> dict | None:
     return {"dream": dream[:160], "recall": recall, "worth": worth}
 
 
-# 整理类调用（做梦/定作息/补觉）的模型任务候选链：首选没成就往后退。
-# 为什么要有链：这些调用默认跟随主回复模型（actor），主模型欠费/挂掉时，
-# 熬夜里的梦、作息、补觉会一起静默消失——它们并不是非 actor 不可。
-_CONSOLIDATE_TASK_CHAIN = ("actor", "sub_actor", "utils_small", "utils")
+# 打分与整理类调用（每条消息的情绪打分 / 做梦 / 定作息 / 补觉）的模型任务候选链：
+# **便宜的先上，主回复模型只当最后兜底**。
+# 0.4.6 之前这条链从 actor 起，等于把"每条消息打一次情绪分 + 每晚的梦和作息"都记在
+# 主回复模型的额度上——这些活儿 utils 段（通常是 8B 级）就做得好，不该占主回复 token。
+# 留 actor 在最后只是为了"整条链全不可用时至少别静默停摆"，正常部署下不会走到它。
+_CONSOLIDATE_TASK_CHAIN = ("utils", "utils_small", "sub_actor", "actor")
 
 
-def _consolidate_tasks(config: HormoneSystemConfig) -> tuple[str, ...]:
-    """整理调用依次尝试的模型任务名：配置的任务优先，再走内置兜底链（去重）。"""
-    named = (config.sleep.consolidate_model_task or "").strip()
+def _task_chain(named_raw: Any) -> tuple[str, ...]:
+    """配置里点名的任务排最前，后面接内置候选链（去重）。"""
+    named = (named_raw or "").strip()
     chain: list[str] = []
     for task in ([named] if named else []) + list(_CONSOLIDATE_TASK_CHAIN):
         if task and task not in chain:
             chain.append(task)
     return tuple(chain)
+
+
+def _consolidate_tasks(config: HormoneSystemConfig) -> tuple[str, ...]:
+    """整理调用依次尝试的模型任务名（配置的任务优先，再走内置兜底链）。"""
+    return _task_chain(config.sleep.consolidate_model_task)
+
+
+def _score_tasks(config: HormoneSystemConfig) -> tuple[str, ...]:
+    """打分调用依次尝试的模型任务名（与整理同一套候选链，去重）。"""
+    return _task_chain(config.score.model_task)
+
 
 
 def _reason(text: Any, limit: int = 90) -> str:
@@ -300,6 +313,7 @@ async def _generate_dream(
     items: list[dict],
     tone: str,
     report: dict | None = None,
+    avoid: list[str] | None = None,
 ) -> dict | None:
     """用模型生成一段梦（只要内容；清不清楚、值不值得记留给醒来那一刀判定）。
 
@@ -310,6 +324,13 @@ async def _generate_dream(
         f"- {it.get('text', '')}" for it in items if it.get("text")
     )
     user_text = f"基调：{tone}\n素材（来自不同时间、顺序已打乱）：\n{material}"
+    if avoid:
+        # 最近已经做过的梦让模型看一眼：别再炒同一盘意象（0.4.5，治"天天做类似的梦"）
+        recent = chr(10).join(f"- {str(t)[:60]}" for t in avoid)
+        user_text += (
+            chr(10) + "她最近几夜已经做过的梦（别再重复这些画面、物件和句式，换新的场景与意象）："
+            + chr(10) + recent
+        )
     raw = await _call_consolidate_llm(
         config, _DREAM_PROMPT, user_text, "hormone_dream", report=report
     )
@@ -516,7 +537,11 @@ class HormonePromptHandler(BaseEventHandler):
         return _normalize_relay_text(content)
 
     async def _score_with_llm(self, text: str, config: HormoneSystemConfig) -> dict[str, Any] | None:
-        """用 LLM 给用户消息打情绪分；返回情绪通道 dict，失败/超时返回 None（调用方回退词典）。"""
+        """用 LLM 给用户消息打情绪分；返回情绪通道 dict，失败/超时返回 None（调用方回退词典）。
+
+        0.4.6：默认不再占主回复模型——按候选链 `utils → utils_small → sub_actor → actor` 依次试，
+        整条链**共享** `timeout_seconds` 这一份预算（打分走在回复前面，绝不能把回复拖慢）。
+        """
         if not config.score.enabled:
             return None
         try:
@@ -526,32 +551,92 @@ class HormonePromptHandler(BaseEventHandler):
             )
             from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
-            # 打分模型：配置为空则跟随对话模型（actor），配了就用自己的
-            task_name = (config.score.model_task or "").strip() or "actor"
-            try:
-                model_set = get_model_set_by_task(task_name)
-            except Exception:
-                if task_name == "actor":
-                    raise
-                logger.warning(f"打分模型任务 '{task_name}' 不可用，回退 actor")
-                model_set = get_model_set_by_task("actor")
-            request = create_llm_request(model_set, "hormone_score")
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SCORE_PROMPT)))
-            request.add_payload(
-                LLMPayload(ROLE.USER, Text(_clip_text(text, config.score.max_input_chars)))
-            )
-            result = await asyncio.wait_for(
-                request.send(stream=False),
-                timeout=config.score.timeout_seconds,
-            )
-            raw = (await result or "").strip()
-            emotions = _parse_emotions(raw)
-            if emotions is None:
-                logger.debug(f"LLM 打分无法解析: {raw[:60]!r}")
-            return emotions
+            budget = max(1.0, float(config.score.timeout_seconds))
+            deadline = time.monotonic() + budget
+            # 每个任务最多吃掉一半预算：远程模型抖一下，不至于把整条链和词典兜底一起废掉
+            per_task = max(1.0, budget * 0.5)
+            reasons: list[str] = []
+            for task in _score_tasks(config):
+                left = deadline - time.monotonic()
+                if left < 0.5:
+                    reasons.append(f"{task}: 预算用完")
+                    break
+                try:
+                    model_set = get_model_set_by_task(task)
+                    if not model_set:
+                        reasons.append(f"{task}: 无可用渠道")
+                        continue
+                    model_set = self._with_temperature(model_set, config)
+                    request = create_llm_request(model_set, "hormone_score")
+                    request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SCORE_PROMPT)))
+                    request.add_payload(
+                        LLMPayload(ROLE.USER, Text(_clip_text(text, config.score.max_input_chars)))
+                    )
+                    result = await asyncio.wait_for(
+                        request.send(stream=False), timeout=min(left, per_task)
+                    )
+                except Exception as exc:  # noqa: BLE001 - 单个任务没成接着试下一个
+                    reasons.append(f"{task}: {_reason(exc)}")
+                    continue
+                raw = (await result or "").strip()
+                self._note_score_task_used(task)
+                emotions = _parse_emotions(raw)
+                if emotions is None:
+                    logger.debug(f"LLM 打分无法解析（任务 {task}）: {raw[:60]!r}")
+                return emotions
+            logger.debug(f"LLM 打分各任务都没成，回退词典: {'；'.join(reasons)}")
+            return None
         except Exception as exc:  # noqa: BLE001 - 打分失败不能影响回复
             logger.debug(f"LLM 打分失败，回退词典: {exc}")
             return None
+
+    @staticmethod
+    def _with_temperature(model_set: Any, config: HormoneSystemConfig) -> Any:
+        """按需覆盖打分温度：打分要稳（默认 0.2），而 model.toml 里服务商条目常常是 0.7。
+
+        只改本地复制出来的 dict，不回写框架的全局配置；`override_temperature=False` 时原样透传。
+        """
+        if not getattr(config.score, "override_temperature", True):
+            return model_set
+        try:
+            temp = float(config.score.temperature)
+        except (TypeError, ValueError):
+            return model_set
+        out: list[Any] = []
+        changed = False
+        for item in model_set:
+            try:
+                entry = dict(item)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                out.append(item)
+                continue
+            if entry.get("temperature") != temp:
+                entry["temperature"] = temp
+                changed = True
+            out.append(entry)
+        if changed and not getattr(HormonePromptHandler, "_temp_note_done", False):
+            HormonePromptHandler._temp_note_done = True
+            logger.debug(f"[Score] 打分温度按插件配置设为 {temp:g}（model.toml 条目原值不动）")
+        return out
+
+    def _note_score_task_used(self, task: str) -> None:
+        """说一句打分实际用的任务；退到主回复相关任务时每天警告一次（这是在烧主回额度）。"""
+        if getattr(self, "_score_task_last", None) == task:
+            return
+        self._score_task_last = task
+        if task in ("actor", "sub_actor"):
+            today = time.strftime("%Y-%m-%d")
+            if getattr(self, "_score_warn_day", None) != today:
+                self._score_warn_day = today
+                logger.warning(
+                    f"[Score] 打分在用 {task}（主回复相关任务），每条消息都在占主回额度；"
+                    f"建议在 model.toml 的 [model_tasks.utils] 里配一个 8B 级模型，"
+                    f"或在插件配置 [score] model_task 指到你自己的任务"
+                )
+            else:
+                logger.debug(f"[Score] 打分当前在用 {task}")
+        else:
+            logger.debug(f"[Score] 打分当前在用 {task}")
 
     @staticmethod
     def _append_extra(values: Any, injection: str) -> None:
@@ -750,10 +835,7 @@ class DreamReviewCommand(BaseCommand):
             }.get(str(gd.get("tone", "neutral")), "有点模糊")
             recall = gd.get("recall", "fuzzy")
             night = system.dream_night_date() if hasattr(system, "dream_night_date") else ""
-            try:
-                label = f"{int(night[5:7])}月{int(night[8:10])}日那晚" if night else "最近那晚"
-            except (ValueError, IndexError):
-                label = "最近那晚"
+            label = night_cn(night) or "最近那晚"
             if recall == "fuzzy":
                 parts.append(f"（{label}的梦，其实记得很模糊了）好像做了个{tone_label}的梦：{gd_text}")
             else:
@@ -767,12 +849,8 @@ class DreamReviewCommand(BaseCommand):
                     continue
                 if gd_text and str(j.get("text")) == gd_text:
                     continue  # 同一条梦上面已经讲过，别再念一遍
-                day = str(j.get("date") or "")
-                try:
-                    day = f"{int(day[5:7])}月{int(day[8:10])}日" if day else ""
-                except (ValueError, IndexError):
-                    pass
-                items.append(f"{day}：{j['text']}" if day else str(j["text"]))
+                day_cn = date_cn(str(j.get("date") or ""))
+                items.append(f"{day_cn}：{j['text']}" if day_cn else str(j["text"]))
             if items:
                 parts.append("最近记着的：" + "；".join(items))
         if not parts:
@@ -1162,7 +1240,12 @@ class HormoneSystemPlugin(BasePlugin):
 
                 # 锁外调模型（可能耗时）→ 不占用 stream 锁、不阻塞回复
                 dream_rep: dict = {}
-                gen = await _generate_dream(cfg, items, tone, report=dream_rep)
+                avoid: list[str] = []
+                try:
+                    avoid = probe2.recent_dream_texts(int(getattr(cfg.sleep, "dream_avoid_nights", 2)))
+                except (AttributeError, TypeError, ValueError):
+                    avoid = []
+                gen = await _generate_dream(cfg, items, tone, report=dream_rep, avoid=avoid)
                 if not gen:
                     self._note_once(
                         f"{sid}:dreamfail",

@@ -103,8 +103,9 @@ plugins/hormone_system/
     **KFC 主动发言/自发思考这类内部提示不算他的话**（`<spontaneous_thought>` / `<inner_thought>` / `<system_reminder>` / `<concept>` 直接忽略：不评分、不进梦料、不刷新互动时间；历史里混进来的读盘时洗掉）。她自己发出去的话由 `HormoneSentHandler` 订阅 `on_message_sent` 进料（只取 `processed_plain_text`，`[图片/[表情/[语音/…` 这类占位与非文本跳过；没有状态文件的流不新建）。每条存 `{text, score, ts, who, clipped}`，按 `turn_clip_chars`（120）截，`clipped` 记录是否被截。
   - 容量：上限取 `max(turn_buffer_max, dream_material_max=120)` 条，超过 `dream_material_days=2` 天的直接丢（`_prune_turns`）。
   - 她自己的话不打分，显著性固定 0.30；**被截断的长回复减半到 0.15**（半句解释不适合当梦料）。
-  - 抽样（`get_generation_input`）：① 最近 24h 里 `score ≤ dream_conflict_threshold` 的强负面必须带 `dream_conflict_quota=2` 条；② 按时间分层「今晚(≤6h) / 今天早些(6–24h) / 更早(24h–2d)」各取最显著的一条；③ 余下按显著性补齐 `top_k`；④ 再随机抓 `dream_random_picks=1` 条换掉最弱的**非强制**项；⑤ 选中项带前后各 `dream_context_lines=1` 句上下文，拼成「他：…／我：…」片段（相邻的会合并，但单个片段最多 `2*ctx+2` 句，避免把一晚并成一大段），片段之间**打乱顺序**，整块不超过 620 字。
+  - 抽样（`get_generation_input`）：① 最近 24h 里 `score ≤ dream_conflict_threshold` 的强负面必须带 `dream_conflict_quota=2` 条；② 按时间分层「今晚(≤6h) / 今天早些(6–24h) / 更早(24h–2d)」各取最显著的一条；③ 余下按显著性补齐 `top_k`；④ 再随机抓 `dream_random_picks=1` `dream_self_max=2` `dream_talk_penalty=0.35` `dream_avoid_nights=2` 条换掉最弱的**非强制**项；④.5 **她的话占比闸**（0.4.5）：选中项里 `who=self` 超过 `dream_self_max=2` 就把显著性最低的几条换掉，只补他的话（强制冲突项都是他的话，不受影响）；⑤ 选中项带前后各 `dream_context_lines=1` 句上下文，拼成「他：…／我：…」片段（相邻的会合并，但单个片段最多 `2*ctx+2` 句，避免把一晚并成一大段），片段之间**打乱顺序**，整块不超过 620 字。
   - **基调下限**：`R ≤ DREAM_R_NIGHTMARE` 仍然 nightmare（走阴影，不产内容）；否则若最近 24h 存在**未消解**的强负面（其后没有 `score ≥ dream_resolve_threshold=0.6` 的正面），基调封顶 `ambivalent`，**不给纯甜**（`dream_sweet_needs_resolve=true` 可关）。冲突窗口按 24h 算，比素材两天窗口窄，这是有意的。
+  - **防梦同质化（0.4.5）**：`dream_talk_penalty=0.35` 给"关于梦的话"（`DREAM_TALK_RE`：梦见/做梦/梦里/那个梦/说说梦…）的显著性打折，切断"天天聊梦→天天梦到梦"的自反馈；`dream_avoid_nights=2` 把最近几夜的梦文本附进 `_generate_dream` 的请求（"别再重复这些画面、物件和句式"），措辞由模型处理，代码不做意象查重。
   - 生成提示词（`_DREAM_PROMPT`）明确：梦是碎的、可换场景/缝在一起；**不要照抄原句、不要把发生过的事按原样讲一遍、不要总结**；素材里有冲突就留着它，不要只挑好的一面。输出 40–70 字。
   - 模型偶尔把 JSON 截断：`_coerce_dream(parsed, raw)` 会从原文里把 `"dream":"…"` 抠出来，不让一夜白丢。
 - **第一刀·熟睡中段生成内容**：`_dream_window_bounds` 求出本夜 `(bed_ts, wake_ts)`，`frac = (now-bed)/(wake-bed)` 落在 `[dream_mid_start_ratio, dream_mid_end_ratio)`（默认 0.3–0.7）才动手；先过三道闸——安静满 onset 阈值（还在聊不做）、本窗口未生成过（`gen_dream.ts` 或 `pending_dream.gen_ts` 早于窗起点才算没做过）、有原料（`recent_turns` Top-`top_k`）。基调由 `_compute_smoothed_aff` + 催产素/皮质醇阈值决定：`nightmare / sweet / ambivalent / neutral`，**噩梦不产内容**，交回阴影路径。
@@ -122,7 +123,9 @@ plugins/hormone_system/
 
 ## 9. 模型调用（三层防护）
 
-1. **候选链**：`_consolidate_tasks()` = `consolidate_model_task`（配置值，留空跳过）→ `actor` → `sub_actor` → `utils_small` → `utils`，去重。前面的任务「不存在 / 接口报错 / 超时 / 空回复」才换下一个；换用成功打一行 `[Model] … 换用备用模型任务 …`。
+1. **候选链**（0.4.6 改序）：`_task_chain()` = 配置点名的任务优先，其后 **`utils → utils_small → sub_actor → actor`**；`_consolidate_tasks()` 用 `consolidate_model_task`（默认 `utils`，留空也用这条链），`_score_tasks()` 用 `[score] model_task`。主回复模型排在最后，**默认不再占主回额度**。
+1. **打分温度**：`_with_temperature()` 复制 model set 后把 `temperature` 覆盖成 `[score] temperature`（默认 0.2），不回写框架全局配置；`override_temperature=false` 时原样透传。
+2. **旧顺序（0.4.5 及以前）**：`consolidate_model_task`（配置值，留空跳过）→ `actor` → `sub_actor` → `utils_small` → `utils`，去重。前面的任务「不存在 / 接口报错 / 超时 / 空回复」才换下一个；换用成功打一行 `[Model] … 换用备用模型任务 …`。
 2. **双层预算**：单任务 `consolidate_timeout_seconds`（25s）；整链共享 `consolidate_total_seconds`（60s），剩余 <1s 就停。预算用 `time.monotonic()` 计（不受测试里 patch `time.time` 影响）。
 3. **失败可见**：`_generate_*` 收一个可选 `report: dict`，失败原因写 `report["error"]`；调用方 `_note_once(key, token=(窗起点, 原因), 消息)` 保证**同一晚同一原因只说一句 INFO**。`_reason()` 负责把空消息异常（如 `asyncio.TimeoutError`）也压成有字的短语。
 4. 任何情况下不抛异常出去。打分链路（`_score_with_llm`）**不做**候选链（它在回复路径上，超时 8s 直接回退词典，避免拖慢回复）。
@@ -146,7 +149,7 @@ plugins/hormone_system/
 
 ## 11. 验收标准
 
-- [ ] 实例日志出现 `✅ 插件加载成功: hormone_system v0.4.4` 与 `睡眠后台任务已注册`，并注册 **5 个组件**（2 个 event_handler + 2 条命令 + config；少了 `hormone_sent_handler` 她的话就不进梦料，少了 `睡眠状态` 命令说明加载的还是旧版）
+- [ ] 实例日志出现 `✅ 插件加载成功: hormone_system v0.4.6` 与 `睡眠后台任务已注册`，并注册 **5 个组件**（2 个 event_handler + 2 条命令 + config；少了 `hormone_sent_handler` 她的话就不进梦料，少了 `睡眠状态` 命令说明加载的还是旧版）
 - [ ] `plan_at` 之后 `[Plan]` 落 `sleep_plan`，且 `night_key` 与当前夜一致
 - [ ] 睡前一直聊 → 醒来 `[Sleep]` 的 `被吵醒=否`，睡眠分不被扣
 - [ ] 熟睡中段（默认 01:30–04:15 视作息）出现 `[DreamPend]` 或明确的「今晚不做梦：…」
@@ -155,20 +158,20 @@ plugins/hormone_system/
 - [ ] `/查看昨晚梦境` 能读出她记住的梦；她的回复里没有激素名/数字
 - [ ] `/睡眠状态` 五行都有内容且不贴聊天原文（只报条数/覆盖天数）
 - [ ] 状态文件损坏 → 重置基线，不崩、不影响回复
-- [ ] 单测 **195 条**全绿（仓库根目录 `test_hormone_v030.py`，在实例根目录跑）+ 整夜 mock 端到端（`test_sim_v04_e2e.py`）
+- [ ] 单测 **224 条**全绿（仓库根目录 `test_hormone_v030.py`，在实例根目录跑）+ 整夜 mock 端到端（`test_sim_v04_e2e.py`）
 - [ ] 入梦原料形如 `昵称：正文`，没有 `[消息id:`/`[QQ:`/`[回复<` 残渣；一条 60 字的话能完整进原料
 - [ ] 她自己说的话也进梦料（`who=self`），片段里能看到「我：…」
 - [ ] 最近 24h 吵过、之后没被哄好时，梦的基调不会是纯甜（至少甜虐）
 
-**测试写法约束（踩过）**：断言不得绑真实钟点（23:00 后跑会被"不能定在过去"防呆顺推）；相位/注入类断言要**冻结 `time.time`** 到指定时刻；mock `_generate_*` 时签名要含 `report=None`；**别让随机抖动决定断言分支**——`_score_sleep` 会对激素加抖动，e2e 的 A4 偶尔落成 `quality=bad`（那走潜意识的阴影，本就不该有美梦行），所以 A6 先显式把 quality 设成 `short` 再断言「梦里还留着甜」。
+**测试写法约束（踩过）**：断言不得绑真实钟点（23:00 后跑会被"不能定在过去"防呆顺推）；相位/注入类断言要**冻结 `time.time`** 到指定时刻；mock `_generate_*` 时签名要含 `report=None`（0.4.5 起还要能吃 `avoid=`，一律写 `**kw` 最稳）；**别让随机抖动决定断言分支**——`_score_sleep` 会对激素加抖动，e2e 的 A4 偶尔落成 `quality=bad`（那走潜意识的阴影，本就不该有美梦行），所以 A6 先显式把 quality 设成 `short` 再断言「梦里还留着甜」。
 
-## 12. 配置默认值速查（v0.4.4 实测读回）
+## 12. 配置默认值速查（v0.4.6 实测读回）
 
 `[core]` `enabled=true` `state_dir=data/plugins/hormone_system` `baseline=50` `half_lives={多巴胺12, 皮质醇6, 催产素72, 血清素48, 内啡肽4, 共情24}` `fatigue_half_life=12` `memory_half_life_hours=1` `max_single_emotional_delta=25` `attachment_threshold=80` `memory_window=8` `max_history=40` `state_version=4`
 
-`[sleep]` `enabled=true` `bedtime=23.5` `wake_time=7.0` **`wind_down_hours=0.5`** `groggy_hours=1.0` `shadow_window_hours=24` `consolidate=true` `consolidate_model_task=""` `dream_mid_start_ratio=0.3` `dream_mid_end_ratio=0.7` `dream_check_minutes=15` `journal_max_days=3` `top_k=5` `turn_buffer_max=40` `dream_material_max=120` `dream_material_days=2.0` `dream_context_lines=1` `dream_random_picks=1` `dream_conflict_quota=2` `dream_conflict_threshold=-0.45` `dream_resolve_threshold=0.6` `dream_sweet_needs_resolve=true` **`turn_clip_chars=120`** `consolidate_timeout_seconds=25.0` `consolidate_total_seconds=60.0` `inject_journal=true` `sleep_onset_gap_minutes=30` `target_sleep_hours=6.0` `sleep_debt_enabled=true` `sleep_debt_cap_hours=12` `debt_decay_per_night=0.8` `oversleep_margin_hours=2.5` `dynamic_schedule=true` `timezone="Asia/Shanghai"` `night_bucket_start=18.0` `night_bucket_end=12.0` `plan_at=21.5` `plan_check_minutes=10` `plan_sane_min_hours=1` `plan_sane_max_hours=12` `earliest_bedtime=20` `latest_bedtime=30` `nap_enabled=true` `nap_check_minutes=20` `nap_quiet_minutes=40` `nap_min_hours=0.5` `nap_max_hours=2` `nap_repay_factor=0.5` `nap_per_day=1` `nap_fatigue_threshold=60` `nap_debt_threshold=2` `nap_recheck_minutes=60` `state_log_minutes=30` `dream_pre_wake_hours=1.0`（已弃用，只为兼容旧 config.toml）
+`[sleep]` `enabled=true` `bedtime=23.5` `wake_time=7.0` **`wind_down_hours=0.5`** `groggy_hours=1.0` `shadow_window_hours=24` `consolidate=true` `consolidate_model_task="utils"` `dream_mid_start_ratio=0.3` `dream_mid_end_ratio=0.7` `dream_check_minutes=15` `journal_max_days=3` `top_k=5` `turn_buffer_max=40` `dream_material_max=120` `dream_material_days=2.0` `dream_context_lines=1` `dream_random_picks=1` `dream_conflict_quota=2` `dream_conflict_threshold=-0.45` `dream_resolve_threshold=0.6` `dream_sweet_needs_resolve=true` **`turn_clip_chars=120`** `consolidate_timeout_seconds=25.0` `consolidate_total_seconds=60.0` `inject_journal=true` `sleep_onset_gap_minutes=30` `target_sleep_hours=6.0` `sleep_debt_enabled=true` `sleep_debt_cap_hours=12` `debt_decay_per_night=0.8` `oversleep_margin_hours=2.5` `dynamic_schedule=true` `timezone="Asia/Shanghai"` `night_bucket_start=18.0` `night_bucket_end=12.0` `plan_at=21.5` `plan_check_minutes=10` `plan_sane_min_hours=1` `plan_sane_max_hours=12` `earliest_bedtime=20` `latest_bedtime=30` `nap_enabled=true` `nap_check_minutes=20` `nap_quiet_minutes=40` `nap_min_hours=0.5` `nap_max_hours=2` `nap_repay_factor=0.5` `nap_per_day=1` `nap_fatigue_threshold=60` `nap_debt_threshold=2` `nap_recheck_minutes=60` `state_log_minutes=30` `dream_pre_wake_hours=1.0`（已弃用，只为兼容旧 config.toml）
 
-`[score]` `enabled=true` `model_task=""`（跟随对话模型）`timeout_seconds=8.0` `max_input_chars=600`；`[idle_drift]/[topic]/[chronic_states]/[fallback_reply]` 默认开（`fallback_reply` 只留接口，未接生成链路）。
+`[score]` `enabled=true` `model_task="utils"` `temperature=0.2` `override_temperature=true`（`timeout_seconds` 是整条链共享的总预算，单任务最多一半）`timeout_seconds=8.0` `max_input_chars=600`；`[idle_drift]/[topic]/[chronic_states]/[fallback_reply]` 默认开（`fallback_reply` 只留接口，未接生成链路）。
 
 **陷阱**：`config.toml` 一旦生成，**升级插件里的默认值不会改它**（例：`wind_down_hours` 由 1.5 改 0.5 需同时改各实例的 `config/plugins/hormone_system/config.toml`）。新增字段才会按新默认补写。
 
@@ -191,6 +194,8 @@ plugins/hormone_system/
 - **v0.4.1**：整理类调用加模型任务候选链与双层时间预算（主回复模型欠费时梦还能做出来）；梦被挡/失败用人话各说一句并节流（键改稳定原因码）；入梦原料剥壳留名（`昵称：正文`，昵称截 12 字；只剩壳的消息不占原料）＋长度改 `turn_clip_chars=120`；注入预算给睡眠段预留位置；收尾期注入她自己定的就寝钟点；`wind_down_hours` 默认 1.5 → 0.5；删「临醒窗口」死代码。
 - **v0.4.1 实盘复盘（2026-10-24 第一夜）**：01:37 主模型 `actor` 失败、`sub_actor` 兜底把两个会话的梦都做出来；醒来结算 7.0h/质量良好、`recall=clear worth=True` 进小本本；樱爱那台 3.3h 被吵醒的夜仍按 `fuzzy+甜` 判成值得记；同夜暴露两个真问题——节流键里带分钟数导致一夜四行、原料 80 字被信封吃掉 63 字只剩 17 字（已修）。
 - **v0.4.2**：重做梦的素材机制——双方发言入料（新增 `on_message_sent` 处理器）、跨两天 120 条、多时间层分层抽样＋随机、片段化并打乱、冲突强制配额与基调下限（未消解的吵架不给纯甜梦）；容忍被截断的模型输出；睡眠时长改按整夜累计安静（`sleep_awake_spans` 区间，<10 分钟间隔算同一段），半夜被吵醒不再作废整夜；内部提示（`<spontaneous_thought>` 等）不再当他说的话；`state_version=4`。实盘复盘（10-26 今昔）：三个会话各出一场梦、主会话基调甜虐；原料 80 条里 59 条 `who=self`；7.1h 的新口径生效。
+- **v0.4.6**：打分/整理从主回复降级到 utils。实测发现每条消息的情绪打分与每晚的梦/作息默认都落在 `actor`（主回复模型，temp 0.9）上——8B 级就能做好的事在烧主回额度。改动：候选链 `utils → utils_small → sub_actor → actor`（`_score_tasks`/`_consolidate_tasks` 共用 `_task_chain`，点名优先+去重）；`[score] model_task` 与 `[sleep] consolidate_model_task` 默认值改 `utils`，留空同样走新链；打分请求自带 `temperature=0.2`（`_with_temperature` 复制后覆盖）；`score.timeout_seconds` 整链共享且单任务最多一半；退到 actor/sub_actor 每天警告一次。服务端实测：打分 1.0–2.5s（原来 utils 一抖就 8.02s 吃掉全部预算）、链只试 `utils` 即成、`model.toml` 条目温度仍 0.7 而请求带 0.2。测试 224 条（37.x/38.x/39.x；39.x 是上线前探针抓到的「13月99日」非法日期 bug）。**注**：v0.4.5 未单独发版，与本版一起出。
+- **v0.4.5**：治"梦太像。实盘（10-30/10-31/11-01 今昔两条流）字面重合只有 3–5%、并非重复生成，但母题高度相似；查素材发现主会话 120 条梦料里 **90 条是她自己的话**，且"糖/掌心/蒜"等意象在素材里一条都没有——相似的来源是**上下文几乎不变**（基调连夜 sweet + 语感全取自她自己），不是照抄素材。改三处：抽样加 `dream_self_max=2` 的占比闸、`dream_talk_penalty=0.35` 给"关于梦的话"降权、`dream_avoid_nights=2` 把最近几夜的梦附进请求要求避开重复意象；`dream_random_picks` 上限 3→5。测试 206 条（36.x 的度量口径注意：相邻素材会被并成同一片段，要按『 ／ 』拆行再数是谁说的）。
 - **v0.4.4**：梦带日期——`pending_dream`/`gen_dream` 记 `night_key`，注入写日期、措辞交给模型，代码里删掉"昨夜/前一夜/N 夜前"的换算与阈值；状态摘要/`/睡眠状态` 一律「记着 10月27日那晚的梦」；`/查看昨晚梦境` 带日期、小本本逐条标日期并去掉重复；`[Sleep]` 结算补「昨晚没做梦/没记住」；修「甜甜的的梦」。测试 195 条。起因：10-26 20:53→10-27 07:57 停机一夜，之后旧梦仍被一律说成"昨晚"，看起来像连着三天做同一个梦。
 - **v0.4.3**：新增只读命令 `/睡眠状态`（`SleepStatusCommand._format_status` 五行：作息／相位＋债／补觉＋梦／梦料条数与覆盖天数／上一夜质量，**只报数量不贴原文**）；README 面向社区重写「已知边界与隐私」「三套常见配置」「自检 / 测试」，并修掉两处不实（原写「测试最后会真调一次模型」——实际所有模型调用都被 monkeypatch 成假响应，不联网不扣 token；`/睡眠状态` 曾被记在 0.4.2 名下）。运行逻辑与 0.4.2 相同。**已收录 Neo-MoFox 插件市场**（https://39.96.71.162/plugin/hormone_system ，状态 published）：提交不走浏览器，用 `Bearer <GitHub token>` 打 `POST /api/v1/plugins` ＋ `POST /api/v1/plugins/{id}/versions`（脚本在仓库 `tools/market_submit/submit.py`）；刷新页面上的 README 用 `PUT /api/v1/plugins/{id}` 只传 `readme_markdown`（脚本 `tools/market_submit/push_docs.py`，一次把 README/SPEC/脚本自身推上去并刷新市场页）。`/api/v1/me*` 那套只认浏览器 OAuth 会话，图标/分类得在网页里改。
 

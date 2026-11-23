@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import re
 import time
 from datetime import datetime, timedelta, tzinfo
 from typing import Any
@@ -115,7 +116,26 @@ DREAM_AMBIVALENT_PROB = 0.15   # 满足条件时，混合梦低频冒出的概�
 # 免得误伤真正在聊提示词的人。
 INTERNAL_MARKERS = ("<spontaneous_thought>",)
 
+def date_cn(day: str) -> str:
+    """把 '2026-11-22' 转成 '11月22日'；不是合法日期就返回空串（别印出 13月99日）。"""
+    if not day:
+        return ""
+    try:
+        d = datetime.fromisoformat(str(day))
+    except (TypeError, ValueError):
+        return ""
+    return f"{d.month}月{d.day}日"
+
+
+def night_cn(key: str) -> str:
+    """夜归属日期的可读形式；非法日期 → 空串。"""
+    d = date_cn(key)
+    return f"{d}那晚" if d else ""
+
+
 DREAM_SELF_SALIENCE = 0.30     # 她自己说的话的固定显著性（够格入梦、不压过强情绪）
+# 「关于梦的话」本身别再当梦料主力，否则会“天天聊梦 → 天天梦到梦”自己转圈
+DREAM_TALK_RE = re.compile(r"(梦见|做梦|梦里|梦中|梦到|那个梦|几个梦|说说梦|昨夜.{0,6}梦)")
 DREAM_FRAGMENT_MAX_CHARS = 620 # 整块梦料送进模型的字数上限
 DREAM_RECENT_HOURS = 6.0       # 「今晚」这一层
 DREAM_MID_HOURS = 24.0         # 「今天早些/昨天」这一层
@@ -1116,10 +1136,7 @@ class HormoneSystem:
         key = self.dream_night_date()
         if not key:
             return "没有梦记录"
-        try:
-            return f"记着 {int(key[5:7])}月{int(key[8:10])}日那晚的梦"
-        except (ValueError, IndexError):
-            return "记着最近那晚的梦"
+        return f"记着 {night_cn(key) or '最近那晚'}的梦"
 
     def _apply_debt_bounds(self) -> None:
         """睡眠债未还清时：抬高皮质醇底线、压低血清素上限（随债下降自动收窄）。"""
@@ -1419,16 +1436,35 @@ class HormoneSystem:
 
     def _turn_salience(self, item: dict) -> float:
         """单条原料的显著性：|情绪分| 为主；她自己说的话给固定中等权重。"""
+        penalty = float(getattr(self._cfg.sleep, "dream_talk_penalty", 0.35))
+        text = str(item.get("text") or "")
+        dream_talk = bool(DREAM_TALK_RE.search(text))
         if str(item.get("who", "user")) == "self":
             # 被截断的长回复（多半是解释/边界话）降权：半句不适合当梦料
-            return DREAM_SELF_SALIENCE * (0.5 if item.get("clipped") else 1.0)
+            score = DREAM_SELF_SALIENCE * (0.5 if item.get("clipped") else 1.0)
+            return score * (penalty if dream_talk else 1.0)
         base = abs(float(item.get("score", 0.0)))
         bonus = 0.0
         if self.hormones.get("oxytocin", 50.0) > 70:
             bonus += 0.15
         if self.hormones.get("empathy", 50.0) > 70:
             bonus += 0.10
-        return base + bonus
+        return (base + bonus) * (penalty if dream_talk else 1.0)
+
+    def recent_dream_texts(self, count: int) -> list[str]:
+        """最近 count 夜记住的梦（新的在前），用来提醒模型别再炒同一盘。"""
+        out: list[str] = []
+        if count <= 0:
+            return out
+        for j in reversed(self.sleep_journal or []):
+            if not isinstance(j, dict) or not j.get("text"):
+                continue
+            t = str(j["text"]).strip()
+            if t and t not in out:
+                out.append(t)
+            if len(out) >= count:
+                break
+        return out
 
     def _conflict_state(self, now: float) -> tuple[bool, float]:
         """最近 24h 的（是否有未消解的强负面，最负的那一分）。"""
@@ -1529,6 +1565,24 @@ class HormoneSystem:
                 weakest = min(swappable, key=lambda j: self._turn_salience(turns[j]))
                 picked.remove(weakest)
                 take(i)
+
+        # ④.5 她自己的话占比上限：素材九成是她说的话时，梦会变成她语气的复述，
+        #        每晚都同一套软话。留几条就够，其余让他说的话/发生的事来驱动。
+        self_max = int(getattr(cfg, "dream_self_max", 2))
+        if 0 <= self_max < top_k:
+            def _is_self(i: int) -> bool:
+                return str(turns[i].get("who", "user")) == "self"
+
+            sel_self = [i for i in picked if _is_self(i) and i not in mandatory]
+            if len(sel_self) > self_max:
+                sel_self.sort(key=lambda j: self._turn_salience(turns[j]))
+                for i in sel_self[: len(sel_self) - self_max]:
+                    picked.remove(i)
+                for i in sorted(range(n), key=lambda j: self._turn_salience(turns[j]), reverse=True):
+                    if len(picked) >= top_k:
+                        break
+                    if i not in picked and not _is_self(i):
+                        take(i)
 
         # ⑤ 片段化：带上下文、合并重叠，再打乱片段顺序（梦不按时间走）
         ctx = int(getattr(cfg, "dream_context_lines", 1))

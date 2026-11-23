@@ -155,8 +155,9 @@ class HormoneSystemConfig(BaseConfig):
             description="睡眠记忆整理/梦生成总开关（默认开；关=只数值衰减，不注册调度、不写小本本、不调模型）",
         )
         consolidate_model_task: str = Field(
-            default="",
-            description="整理/生成用的模型任务名（对应 model.toml 的 [model_tasks.xxx]）；留空 = 从主回复模型(actor)起；首选没成会自动退到 sub_actor/utils_small/utils 备用任务",
+            default="utils",
+            description="整理/生成用的模型任务名（对应 model.toml 的 [model_tasks.xxx]）；默认 utils（通常是 8B 级），留空也从 utils 起，"
+                        "依次退 utils_small/sub_actor/actor——主回复模型 actor 只作最后兜底，别把每晚的梦和作息记在主回额度上",
         )
         dream_pre_wake_hours: float = Field(
             default=1.0,
@@ -181,6 +182,18 @@ class HormoneSystemConfig(BaseConfig):
             ge=5,
             le=60,
             description="定时任务检查间隔（分钟）；落在熟睡窗口才生成梦",
+        )
+        dream_talk_penalty: float = Field(
+            default=0.35,
+            ge=0.0,
+            le=1.0,
+            description="「关于梦的话」再入梦的显著性折扣（切断『天天聊梦→天天梦到梦』的自反馈；0=完全不入梦）",
+        )
+        dream_avoid_nights: int = Field(
+            default=2,
+            ge=0,
+            le=7,
+            description="把最近几夜做过的梦交给模型并要求避开这些意象（0=不给，允许炒冷饭）",
         )
         journal_max_days: int = Field(
             default=3,
@@ -221,8 +234,14 @@ class HormoneSystemConfig(BaseConfig):
         dream_random_picks: int = Field(
             default=1,
             ge=0,
-            le=3,
+            le=5,
             description="除按显著性挑的之外再随机抓几条，让梦不是每次都同一批",
+        )
+        dream_self_max: int = Field(
+            default=2,
+            ge=0,
+            le=10,
+            description="一次做梦最多带几条「她自己说的话」（设成 top_k 以上=不限制，回到旧行为）",
         )
         dream_conflict_quota: int = Field(
             default=2,
@@ -465,12 +484,23 @@ class HormoneSystemConfig(BaseConfig):
             description="是否用 LLM 给用户消息打情绪分（关闭则回退词典打分）",
         )
         model_task: str = Field(
-            default="",
-            description="打分专用模型任务名（对应 model.toml 的 [model_tasks.xxx]）；留空 = 跟随对话模型",
+            default="utils",
+            description="打分专用模型任务名（对应 model.toml 的 [model_tasks.xxx]）；默认 utils（通常是 8B 级），留空也从 utils 起，"
+                        "依次退 utils_small/sub_actor/actor——每条消息都要打一次分，不该烧主回复模型的额度",
         )
         timeout_seconds: float = Field(
             default=8.0,
-            description="打分调用超时（秒），超时自动回退词典打分",
+            description="打分调用的总预算（秒）：候选链上所有任务共用，且每个任务最多用一半，用完就回退词典打分",
+        )
+        temperature: float = Field(
+            default=0.2,
+            ge=0.0,
+            le=2.0,
+            description="打分请求的采样温度（打分要可复现；model.toml 里服务商条目常是 0.7）；只作用于本插件的调用",
+        )
+        override_temperature: bool = Field(
+            default=True,
+            description="关掉 = 不覆盖温度，沿用 model.toml 里各模型自己配的 temperature",
         )
         max_input_chars: int = Field(
             default=600,

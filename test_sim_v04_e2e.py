@@ -67,7 +67,7 @@ def seed(store, cfg, sid, **kw):
 async def fake_plan(config, system, report=None):
     return {"bedtime": 23.5, "duration_h": 6.5, "note": "t", "source": "model"}
 
-async def fake_dream(config, items, tone, report=None):
+async def fake_dream(config, items, tone, report=None, **kw):
     return {"dream": "梦见和你走在夜路上", "recall": "fuzzy", "worth": False}
 
 async def fake_nap(config, system, report=None):

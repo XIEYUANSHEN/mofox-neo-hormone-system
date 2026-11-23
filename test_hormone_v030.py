@@ -186,12 +186,12 @@ async def gen_tests():
         raise RuntimeError("no model configured")
     llm.get_model_set_by_task = boom
     try:
-        # 空 task → 解析成 actor，actor 也不可用 → None（不抛）
+        # 空 task → 从 utils 起的整条链；全部不可用 → None（不抛）
         r1 = await hp._generate_dream(cfg_consolidate(True, task=""), [{"text": "x"}], "sweet")
-        check("9.1 空task且actor不可用→None(跳过)", r1 is None)
-        # 坏 task → 回退 actor，也不可用 → None
+        check("9.1 空task且候选链全不可用→None(跳过)", r1 is None)
+        # 坏 task → 继续走内置候选链，仍不可用 → None
         r2 = await hp._generate_dream(cfg_consolidate(True, task="no_such_zzz"), [{"text": "x"}], "sweet")
-        check("9.2 坏task回退actor仍不可用→None", r2 is None)
+        check("9.2 坏task退内置链仍不可用→None", r2 is None)
     finally:
         llm.get_model_set_by_task = orig
 asyncio.run(gen_tests())
@@ -243,7 +243,7 @@ async def job_test():
     store.save("jobuser", seed.to_state(cfg.core.state_version))
 
     seen = {"tone": None}
-    async def fake_gen(config, items, tone, report=None):
+    async def fake_gen(config, items, tone, report=None, **kw):
         seen["tone"] = tone
         return {"dream": "梦见和你走在夜路上", "recall": "clear", "worth": True}
     inst = hp.HormoneSystemPlugin.__new__(hp.HormoneSystemPlugin)
@@ -261,7 +261,7 @@ async def job_test():
     check("11.3 job 后 recent_turns 清空", bool(out) and out.get("recent_turns") == [])
 
     calls = {"n": 0}
-    async def count_gen(config, items, tone, report=None):
+    async def count_gen(config, items, tone, report=None, **kw):
         calls["n"] += 1
         return {"dream": "x", "recall": "clear", "worth": True}
     hp._generate_dream = count_gen
@@ -624,7 +624,7 @@ async def awake_job_test():
     seed.last_interaction_time = time.time() - 5 * 60  # 刚聊过 = 醒着
     store.save("awake", seed.to_state(3))
     calls = {"n": 0}
-    async def fake(config, items, tone, report=None):
+    async def fake(config, items, tone, report=None, **kw):
         calls["n"] += 1
         return {"dream": "不该有", "recall": "fuzzy", "worth": False}
     orig = hp._generate_dream
@@ -710,8 +710,8 @@ def _dead(name):
 
 # 23.1–23.4 纯函数
 c23a = HormoneSystemConfig()
-check("23.1 默认兜底链=actor起依次备用",
-      hp._consolidate_tasks(c23a) == ("actor", "sub_actor", "utils_small", "utils"),
+check("23.1 默认候选链=便宜的先上、actor 最后兜底（0.4.6 不再占主回额度）",
+      hp._consolidate_tasks(c23a) == ("utils", "utils_small", "sub_actor", "actor"),
       str(hp._consolidate_tasks(c23a)))
 c23b = cfg_consolidate(True, task="hormone_sleep")
 check("23.2 配置任务排最前且不重复",
@@ -725,23 +725,40 @@ _O_GMS, _O_CLR = _api.get_model_set_by_task, _api.create_llm_request
 _O_LOG = hp.logger
 
 async def chain_tests():
-    # A：actor 挂了 → 备用任务把梦做出来
+    # A：便宜任务活着 → 一次就成，绝不碰主回复模型（0.4.6 的目的）
     seen = []
-    def gms_failover(name):
+    def gms_ok_cheap(name):
         seen.append(name)
         if name == "actor":
             _dead(name)
         return ["fake"]
-    _api.get_model_set_by_task = gms_failover
+    _api.get_model_set_by_task = gms_ok_cheap
     _api.create_llm_request = lambda ms, rn: _FakeReq23(text='{"dream":"梦见和你走在夜路上"}')
     rep = {}
     out = await hp._generate_dream(
         _cfg23(tempfile.mkdtemp(prefix="hormone_chain_")),
         [{"text": "他说最喜欢你", "score": 0.8, "ts": 0.0}], "sweet", report=rep
     )
-    check("23.5 actor挂→备用任务仍做出梦",
+    check("23.5 便宜任务可用时只试 utils 就成，不占主回额度",
           bool(out) and out["dream"] == "梦见和你走在夜路上"
-          and seen[:2] == ["actor", "sub_actor"] and not rep.get("error"), f"seen={seen}")
+          and seen == ["utils"] and not rep.get("error"), f"seen={seen}")
+
+    # A2：utils/utils_small/sub_actor 全挂、只有 actor 活着 → 仍要把梦做出来（兜底不静默）
+    seen2 = []
+    def gms_only_actor(name):
+        seen2.append(name)
+        if name != "actor":
+            _dead(name)
+        return ["fake"]
+    _api.get_model_set_by_task = gms_only_actor
+    rep_a2 = {}
+    out_a2 = await hp._generate_dream(
+        _cfg23(tempfile.mkdtemp(prefix="hormone_chain_actor_")),
+        [{"text": "他说最喜欢你", "score": 0.8, "ts": 0.0}], "sweet", report=rep_a2
+    )
+    check("23.5b 便宜链全挂→最后退到 actor 仍做出梦",
+          bool(out_a2) and seen2 == ["utils", "utils_small", "sub_actor", "actor"]
+          and not rep_a2.get("error"), f"seen={seen2}")
 
     # B：全都不可用 → None + 原因里带任务名
     rep2 = {}
@@ -812,7 +829,8 @@ async def chain_tests():
     store_f = HormoneStateStore(cfg_f.core.state_dir)
     _c23[0] = _ts23(24, 3, 0)
     _seed23(cfg_f, store_f, "ok")
-    _api.get_model_set_by_task = lambda name: _dead(name) if name == "actor" else ["fake"]
+    # 首选 utils 挂掉 → 退到 utils_small：链子要能自己接上，并且把"换用"说一句
+    _api.get_model_set_by_task = lambda name: _dead(name) if name == "utils" else ["fake"]
     _api.create_llm_request = lambda ms, rn: _FakeReq23(text='{"dream":"梦见你把星星装进罐子"}')
     cap_f = _Cap23()
     hp.logger = cap_f
@@ -1404,6 +1422,291 @@ check("34.7 注入里带日期，不说死「昨晚」",
 s34b.gen_dream = _dream("2026-10-27", text="梦见碗架上的水汽", ts=time.time() - 25 * 3600)
 _p34b = build_mood_prompt(s34b, c34b)
 check("34.8 超过 24h 的梦不再注入", "梦里还留着甜" not in _p34b, _p34b[:300])
+# ===== 35. 别再炒同一盘（0.4.5）：梦话降权 + 最近做过的梦交给模型避开 =====
+c35 = cfg_consolidate(True)
+s35 = HormoneSystem(c35)
+s35.hormones["oxytocin"] = 50.0
+s35.hormones["empathy"] = 50.0
+
+_plain = {"text": "他：今天把动画做完了半截", "score": 0.0, "ts": time.time(), "who": "self", "clipped": False}
+_dreamy = {"text": "我：昨夜那个梦，人家方才没细说", "score": 0.0, "ts": time.time(), "who": "self", "clipped": False}
+s_plain = s35._turn_salience(_plain)
+s_dreamy = s35._turn_salience(_dreamy)
+check("35.1 关于梦的话入梦显著性被压低", s_dreamy < s_plain and abs(s_dreamy - s_plain * 0.35) < 1e-9,
+      f"{s_plain} vs {s_dreamy}")
+c35b = cfg_consolidate(True)
+c35b.sleep.dream_talk_penalty = 1.0
+s35b = HormoneSystem(c35b)
+check("35.2 折扣设成 1 时不降权（想退回旧行为）",
+      abs(s35b._turn_salience(_dreamy) - s35b._turn_salience(_plain)) < 1e-9, s35b._turn_salience(_dreamy))
+c35c = cfg_consolidate(True)
+c35c.sleep.dream_talk_penalty = 0.0
+s35c = HormoneSystem(c35c)
+check("35.3 折扣 0 = 完全不入梦", s35c._turn_salience(_dreamy) == 0.0, s35c._turn_salience(_dreamy))
+check("35.4 他说要听梦也算梦话", s35c._turn_salience({"text": "中生：好啦今昔给我说说梦把", "score": 0.9,
+                                                      "ts": time.time(), "who": "user"}) == 0.0)
+
+s35.sleep_journal = [
+    {"date": "2026-10-30", "text": "抱着蒜进电梯"},
+    {"date": "2026-10-31", "text": "隔着衣料摸手背"},
+    {"date": "2026-11-01", "text": "硬糖硌在掌心"},
+    {"date": "2026-11-01", "text": "硬糖硌在掌心"},
+]
+_r = s35.recent_dream_texts(2)
+check("35.5 最近几夜的梦：新的在前、去重、限条数", _r == ["硬糖硌在掌心", "隔着衣料摸手背"], _r)
+check("35.6 设 0 就不给", s35.recent_dream_texts(0) == [], s35.recent_dream_texts(0))
+
+# _generate_dream 是否把「别重复」带进请求
+_captured: dict = {}
+
+
+async def _fake_llm(config, system_text, user_text, request_name, report=None, **kw):
+    _captured["user_text"] = user_text
+    return '{"dream":"新的梦"}'
+
+
+_real_llm = hp._call_consolidate_llm
+hp._call_consolidate_llm = _fake_llm
+try:
+    _items = [{"text": "他：把蒜放进电梯"}]
+    asyncio.run(hp._generate_dream(c35, _items, "sweet", avoid=["硬糖硌在掌心"]))
+    check("35.7 请求里带上最近做过的梦", "她最近几夜已经做过的梦" in _captured.get("user_text", "")
+          and "硬糖硌在掌心" in _captured.get("user_text", ""), str(_captured.get("user_text", ""))[:160])
+    _captured.clear()
+    asyncio.run(hp._generate_dream(c35, _items, "sweet"))
+    check("35.8 不给 avoid 就不加这段", "她最近几夜" not in _captured.get("user_text", ""),
+          str(_captured.get("user_text", ""))[:120])
+finally:
+    hp._call_consolidate_llm = _real_llm
+# ===== 36. 她的话占比上限（0.4.5）：梦别只复述她自己的语气 =====
+c36 = cfg_consolidate(True)
+c36.sleep.top_k = 5
+c36.sleep.dream_context_lines = 0
+c36.sleep.dream_random_picks = 0       # 去掉随机，断言稳定
+c36.sleep.dream_self_max = 2
+_now36 = time.time()
+
+
+def _lines36(frags):
+    """片段会把相邻素材并成一段，所以按『 ／ 』拆回一行一行再数是谁说的。"""
+    return [p for f in frags for p in str(f["text"]).split(" ／ ")]
+
+
+def _tally(frags):
+    ls = _lines36(frags)
+    return sum(1 for p in ls if p.startswith("我：")), sum(1 for p in ls if p.startswith("他："))
+
+
+def _material36(sys_obj):
+    sys_obj.hormones["oxytocin"] = 60.0
+    sys_obj.hormones["empathy"] = 60.0
+    sys_obj.recent_turns = (
+        [{"text": f"今天好困呀{i}", "score": 0.0, "ts": _now36 - i * 600, "who": "self"} for i in range(10)]
+        + [{"text": "我把你写进动画里了", "score": 0.7, "ts": _now36 - 1800, "who": "user"},
+           {"text": "你说过的话我都记得", "score": 0.6, "ts": _now36 - 5400, "who": "user"}]
+    )
+
+
+s36 = HormoneSystem(c36)
+_material36(s36)
+_frags36, _tone36 = s36.get_generation_input()
+_mine36, _his36 = _tally(_frags36)
+check("36.1 素材九成是她的话时，进梦也不超过 dream_self_max 条", _mine36 <= 2 and _his36 >= 2,
+      f"我 {_mine36} / 他 {_his36} / {len(_frags36)} 段")
+c36b = cfg_consolidate(True)
+c36b.sleep.top_k = 5
+c36b.sleep.dream_context_lines = 0
+c36b.sleep.dream_random_picks = 0
+c36b.sleep.dream_self_max = 9          # 高于 top_k = 不限制
+s36b = HormoneSystem(c36b)
+_material36(s36b)
+_frags36b, _ = s36b.get_generation_input()
+check("36.2 上限调到 top_k 以上就退回旧行为（她的话为主）", _tally(_frags36b)[0] > 2, _tally(_frags36b))
+
+# 强制的冲突项（都是他的话）不能被这条规则挤掉
+c36c = cfg_consolidate(True)
+c36c.sleep.top_k = 4
+c36c.sleep.dream_context_lines = 0
+c36c.sleep.dream_random_picks = 0
+c36c.sleep.dream_self_max = 1
+s36c = HormoneSystem(c36c)
+s36c.hormones["oxytocin"] = 60.0
+s36c.hormones["empathy"] = 60.0
+s36c.recent_turns = (
+    [{"text": f"软话{i}", "score": 0.0, "ts": _now36 - i * 300, "who": "self"} for i in range(6)]
+    + [{"text": "你每次都这样敷衍", "score": -0.8, "ts": _now36 - 900, "who": "user"},
+       {"text": "算了不说了", "score": -0.6, "ts": _now36 - 1200, "who": "user"}]
+)
+_frags36c, _tone36c = s36c.get_generation_input()
+_mine36c, _his36c = _tally(_frags36c)
+check("36.3 冲突配额照进、基调封顶甜虐，且她的话仍受限",
+      _tone36c == "ambivalent" and _his36c >= 2 and _mine36c <= 1, f"{_tone36c} 我{_mine36c}/他{_his36c}")
+# ===== 37. 打分/整理的默认任务：不烧主回复额度（0.4.6） =====
+_c37 = HormoneSystemConfig()
+_c37.score.enabled = True
+_c37.core.enabled = True
+check("37.1 打分候选链默认=utils 先、actor 最后兜底",
+      hp._score_tasks(_c37) == ("utils", "utils_small", "sub_actor", "actor"), str(hp._score_tasks(_c37)))
+_c37b = HormoneSystemConfig()
+_c37b.score.enabled = True
+_c37b.score.model_task = ""          # 老实例生成的 config.toml 里就是空串
+check("37.2 老配置留空也从 utils 起（不靠改配置文件）",
+      hp._score_tasks(_c37b) == ("utils", "utils_small", "sub_actor", "actor"), str(hp._score_tasks(_c37b)))
+check("37.3 两处默认值都写死到 utils",
+      _c37.score.model_task == "utils" and _c37.sleep.consolidate_model_task == "utils",
+      f"{_c37.score.model_task}/{_c37.sleep.consolidate_model_task}")
+
+_h37 = hp.HormonePromptHandler.__new__(hp.HormonePromptHandler)
+_O_GMS37, _O_CLR37 = _api.get_model_set_by_task, _api.create_llm_request
+_O_WARN37 = hp.logger.warning
+
+
+async def score_chain_tests():
+    seen = []
+    _api.get_model_set_by_task = lambda name: (seen.append(name), ["fake"])[1]
+    _api.create_llm_request = lambda ms, rn: _FakeReq23(text='{"warmth": 0.8}')
+    got = await _h37._score_with_llm("今天也想你", _c37)
+    check("37.4 utils 活着时只试 utils，绝不碰 actor",
+          got == {"warmth": 0.8} and seen == ["utils"], f"seen={seen} got={got}")
+
+    # 只有 actor 可用 → 仍然出分，但要吼一声「在占主回额度」，且当天只吼一次
+    seen2, warns = [], []
+    def gms_actor_only(name):
+        seen2.append(name)
+        if name != "actor":
+            _dead(name)
+        return ["fake"]
+    _api.get_model_set_by_task = gms_actor_only
+    hp.logger.warning = lambda *a, **k: warns.append(" ".join(str(x) for x in a))
+    got2 = await _h37._score_with_llm("今天也想你", _c37)
+    seen_first_call = list(seen2)
+    got2b = await _h37._score_with_llm("明天也想你", _c37)
+    hp.logger.warning = _O_WARN37
+    check("37.5 退到 actor 仍能出分，但说清在占主回额度",
+          got2 == {"warmth": 0.8} and seen_first_call == ["utils", "utils_small", "sub_actor", "actor"]
+          and any("主回额度" in w for w in warns), f"seen={seen_first_call} warns={warns[:1]}")
+    check("37.6 这条警告每天只说一句（不刷屏）", len([w for w in warns if "主回额度" in w]) == 1, warns)
+
+    # 全挂 → None（调用方回退词典），且不抛
+    seen3 = []
+    def gms_dead(name):
+        seen3.append(name)
+        _dead(name)
+    _api.get_model_set_by_task = gms_dead
+    got3 = await _h37._score_with_llm("测试", _c37)
+    check("37.7 全链不可用→None 走词典兜底",
+          got3 is None and seen3 == ["utils", "utils_small", "sub_actor", "actor"], f"seen={seen3}")
+
+    # 总预算：timeout_seconds 是整条链共享的，慢任务不能把回复拖成一串超时
+    _c37c = HormoneSystemConfig()
+    _c37c.score.enabled = True
+    _c37c.score.timeout_seconds = 1.0
+    _h37c = hp.HormonePromptHandler.__new__(hp.HormonePromptHandler)
+    order = []
+
+    def gms_tag(name):
+        order.append(name)
+        return [name]
+
+    def clr(ms, rn):
+        # utils 那一档故意慢 2.5s；后面的任务都很快
+        return _FakeReq23(slow=2.5) if ms == ["utils"] else _FakeReq23(text='{"warmth": 0.5}')
+
+    _api.get_model_set_by_task = gms_tag
+    _api.create_llm_request = clr
+    _t0 = time.time()
+    got4 = await _h37c._score_with_llm("测试预算", _c37c)
+    _spent = time.time() - _t0
+    check("37.8 整条链共享 timeout_seconds（慢任务不会累加成一长串超时）",
+          got4 is None and _spent < 2.2 and order[:1] == ["utils"], f"spent={_spent:.2f}s order={order}")
+
+
+try:
+    asyncio.run(score_chain_tests())
+finally:
+    _api.get_model_set_by_task, _api.create_llm_request = _O_GMS37, _O_CLR37
+    hp.logger.warning = _O_WARN37
+# ===== 38. 打分温度与预算分配（0.4.6 实测带出来的两处） =====
+def _mk_ms(entries):
+    return [{"model_identifier": n, "temperature": 0.7, "base_url": "https://x"} for n in entries]
+
+
+_src = _mk_ms(["qwen3-8b"])
+_out = hp.HormonePromptHandler._with_temperature(_src, _c37)
+check("38.1 温度按插件配置覆盖，且不改框架返回的原对象",
+      _out[0]["temperature"] == 0.2 and _src[0]["temperature"] == 0.7 and _out is not _src,
+      f"{_out[0]['temperature']} / 原 {_src[0]['temperature']}")
+_c38 = HormoneSystemConfig()
+_c38.score.enabled = True
+_c38.score.override_temperature = False
+check("38.2 override_temperature=False 时原样透传（沿用服务商温度）",
+      hp.HormonePromptHandler._with_temperature(_src, _c38) is _src)
+
+_seen_ms: list = []
+
+
+async def temp_and_budget_tests():
+    global _api
+    def clr(ms, rn):
+        _seen_ms.append(ms)
+        return _FakeReq23(text='{"warmth": 0.6}')
+    _api.get_model_set_by_task = lambda name: _mk_ms(["qwen3-8b"])
+    _api.create_llm_request = clr
+    h38 = hp.HormonePromptHandler.__new__(hp.HormonePromptHandler)
+    got = await h38._score_with_llm("测试温度", _c37)
+    sent = _seen_ms[-1][0] if _seen_ms else {}
+    check("38.3 打分请求实际带上了 0.2 温度",
+          got == {"warmth": 0.6} and sent.get("temperature") == 0.2 and sent.get("model_identifier") == "qwen3-8b",
+          str(sent))
+
+    # 预算公平：首选抖到超时，第二个任务还得有机会（不能被一个慢远程吃光整份预算）
+    order2 = []
+    def gms_two(name):
+        order2.append(name)
+        return ["fast"] if name == "utils_small" else ["slow"]
+
+    def clr2(ms, rn):
+        return _FakeReq23(slow=3.0) if ms == ["slow"] else _FakeReq23(text='{"care": 0.5}')
+
+    _c38b = HormoneSystemConfig()
+    _c38b.score.enabled = True
+    _c38b.score.timeout_seconds = 2.0        # 每任务最多 1.0s
+    _api.get_model_set_by_task = gms_two
+    _api.create_llm_request = clr2
+    h38b = hp.HormonePromptHandler.__new__(hp.HormonePromptHandler)
+    _t0 = time.time()
+    got2 = await h38b._score_with_llm("测试预算分配", _c38b)
+    _spent2 = time.time() - _t0
+    check("38.4 慢任务只吃掉一半预算，第二个任务仍能出分",
+          got2 == {"care": 0.5} and order2[:2] == ["utils", "utils_small"] and _spent2 < 1.9,
+          f"spent={_spent2:.2f}s order={order2} got={got2}")
+
+
+try:
+    asyncio.run(temp_and_budget_tests())
+finally:
+    _api.get_model_set_by_task, _api.create_llm_request = _O_GMS37, _O_CLR37
+# ===== 39. 非法日期不许印出来（0.4.6 探针抓到的 bug） =====
+from hormone_system.hormone import night_cn as hp_night_cn, date_cn as hp_date_cn
+
+check("39.1 合法夜日期", hp_night_cn("2026-11-22") == "11月22日那晚", hp_night_cn("2026-11-22"))
+check("39.2 非法数字日期不再拼出 13月99日",
+      hp_night_cn("2026-13-99") == "" and hp_date_cn("乱码") == "" and hp_date_cn("") == "",
+      f"{hp_night_cn('2026-13-99')!r} {hp_date_cn('乱码')!r}")
+s39 = HormoneSystem(cfg_consolidate(True))
+s39.gen_dream = {"text": "一场梦", "tone": "sweet", "recall": "clear", "worth": True,
+                 "ts": time.time(), "night_key": "2026-13-99"}
+check("39.3 摘要退回「最近那晚」", s39.dream_brief() == "记着 最近那晚的梦", s39.dream_brief())
+s39.sleep_journal = [{"date": "2026-13-99", "text": "带脏日期的一条"},
+                     {"date": "2026-11-20", "text": "正常的一条"}]
+_txt39 = hp.DreamReviewCommand._format(s39)
+check("39.4 命令里不出现 13月99日，脏日期那条不带前缀",
+      "13月99日" not in _txt39 and "最近那晚" in _txt39 and "11月20日：正常的一条" in _txt39
+      and "带脏日期的一条" in _txt39 and "13月99日：" not in _txt39, _txt39.replace(chr(10), " ")[:120])
+s39.gen_dream = {"text": "一场梦", "tone": "sweet", "recall": "clear", "worth": True,
+                 "ts": time.time()}
+check("39.5 完全没有 night_key 时按 ts 反推（不是空标签）",
+      s39.dream_night_date() != "" and "那晚的梦" in s39.dream_brief(), s39.dream_brief())
 print("\n==== RESULT ====")
 print("FAILED:", fails if fails else "NONE")
 sys.exit(1 if fails else 0)
