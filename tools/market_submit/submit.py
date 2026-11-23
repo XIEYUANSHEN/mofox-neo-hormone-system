@@ -1,5 +1,6 @@
-"""把 hormone_system 0.4.3 提交到 Neo-MoFox 插件市场（注册插件 + 提交版本）。
+"""把 hormone_system 当前版（读 manifest.json）提交到 Neo-MoFox 插件市场（注册插件 + 提交版本）。
 
+版本号/资产名都从 manifest 取，避免脚本里写死成上一版（0.4.4 那次就差点重发旧号）。
 token 只从 git credential manager 取，不打印、不落盘。
 """
 import hashlib
@@ -13,7 +14,14 @@ MARKET = "https://39.96.71.162"
 HERE = os.path.dirname(os.path.abspath(__file__))
 UP1 = os.path.dirname(HERE)  # 工作目录布局：UP1 = <ws>；仓库布局：UP1 = <repo>/tools
 DOCS = os.path.join(UP1, "docsync") if os.path.isfile(os.path.join(UP1, "docsync", "README.md")) else os.path.dirname(UP1)
-def find_asset(name="hormone_system-0.4.4.mfp"):
+# 工作目录里插件源码在 hormone_prod/，仓库里是 hormone_system/
+PKG = os.path.join(UP1, "hormone_prod") if os.path.isdir(os.path.join(UP1, "hormone_prod")) else os.path.join(DOCS, "hormone_system")
+MANIFEST = json.load(open(os.path.join(PKG, "manifest.json"), encoding="utf-8"))
+VER = str(MANIFEST["version"])
+MIN_CORE = str(MANIFEST.get("min_core_version", "1.3.0-alpha.0"))
+
+
+def find_asset(name):
     """.mfp 不在仓库里（.gitignore 掉了 dist/*.mfp），所以按几个常见位置找，或用 HORMONE_MFP 指定。"""
     cands = [os.environ.get("HORMONE_MFP"),
              os.path.join(UP1, name), os.path.join(os.path.dirname(UP1), "dist", name),
@@ -24,7 +32,7 @@ def find_asset(name="hormone_system-0.4.4.mfp"):
     raise SystemExit(f"找不到发布产物 {name}——设 HORMONE_MFP=<路径> 再跑")
 
 
-ASSET = find_asset()
+ASSET = find_asset(f"hormone_system-{VER}.mfp")
 README = os.path.join(DOCS, "README.md")
 REPO = "https://github.com/XIEYUANSHEN/mofox-neo-hormone-system"
 PLUGIN_ID = "hormone_system"
@@ -33,25 +41,26 @@ PLUGIN_ID = "hormone_system"
 def _fill(env=None):
     out = subprocess.run(["git", "credential", "fill"],
                          input="protocol=https\nhost=github.com\n\n",
-                         capture_output=True, text=True, timeout=35, env=env).stdout
+                         capture_output=True, text=True, timeout=100, env=env).stdout
     return dict(l.split("=", 1) for l in out.splitlines() if "=" in l).get("password")
 
 
 def gh_token():
-    # 静默优先；不行再走一次正常调用——GCM 需要刷新时只走 never 模式会假报"没有 token"
-    env = dict(os.environ, GCM_INTERACTIVE="never", GIT_TERMINAL_PROMPT="0")
+    # 正常调用优先（凭据在缓存里时几秒就返回）；不行再试静默模式。
+    # 反过来会踩坑：never 模式失败时留下的 GCM 子进程会让第二次调用撞锁卡死（2026-10-27 实遇）。
     try:
-        tok = _fill(env)
+        tok = _fill()
         if tok:
             return tok
     except subprocess.TimeoutExpired:
         pass
+    env = dict(os.environ, GCM_INTERACTIVE="never", GIT_TERMINAL_PROMPT="0")
     try:
-        tok = _fill()
+        tok = _fill(env)
     except subprocess.TimeoutExpired:
-        raise SystemExit("git credential fill 卡住：GCM 在等交互窗口，请先在桌面终端登录。")
+        tok = None
     if not tok:
-        raise SystemExit("GCM 取不到 GitHub token——先跑 `git credential-manager github login`。")
+        raise SystemExit("git credential fill 拿不到 token：请先在桌面终端跑 `git credential-manager github login`。")
     return tok
 
 
@@ -95,7 +104,9 @@ def main():
             "六激素状态机 + 睡眠节律。情绪按半衰期回归基线并调制注入 prompt（只给自然语言，不出现数字与激素名）；"
             "睡眠层全自动：睡前收尾、按安静时长判定是否被吵醒、整夜累计安静算睡眠时长、睡眠债与连续短睡、白天自己决定补觉、"
             "熟睡中段用双方近两天的发言做梦料生成梦、醒来按规则判定记不记得/值不值得记进小本本。"
-            "v0.4.4 起梦带日期（哪天夜里做的写在注入里，措辞交给模型，不再一律当「昨晚」）；另有只读命令 /睡眠状态 与 README 的「已知边界与隐私」一节。"
+            "v0.4.4 起梦带日期（哪天夜里做的写在注入里，措辞交给模型，不再一律当「昨晚」）；v0.4.5 起防梦同质化（她自己话的占比、"
+            "关于梦的话降权、别再重复最近两夜的意象）；v0.4.6 起打分与整理的默认模型任务从主回复 actor 降到 utils（8B 级），"
+            "打分自带 temperature 0.2，超时预算按候选链上的任务分配。另有只读命令 /睡眠状态 与 README 的「已知边界与隐私」一节。"
             "依赖 kokoro_flow_chatter（KFC）。"
         ),
         "homepage": REPO,
@@ -108,22 +119,22 @@ def main():
         "readme_markdown": readme,
     }
     version = {
-        "version": "0.4.4",
-        "release_tag": "v0.4.4",
-        "release_title": "hormone_system 0.4.4",
-        "release_url": f"{REPO}/releases/tag/v0.4.4",
-        "asset_name": "hormone_system-0.4.4.mfp",
-        "asset_download_url": f"{REPO}/releases/download/v0.4.4/hormone_system-0.4.4.mfp",
+        "version": VER,
+        "release_tag": "v" + VER,
+        "release_title": f"hormone_system {VER}",
+        "release_url": f"{REPO}/releases/tag/v{VER}",
+        "asset_name": f"hormone_system-{VER}.mfp",
+        "asset_download_url": f"{REPO}/releases/download/v{VER}/hormone_system-{VER}.mfp",
         "checksum_sha256": sha,
         "file_size": len(data),
         "is_prerelease": False,
         "plugin_api_version": "1.0",
-        "min_host_version": "1.3.0-alpha.0",
+        "min_host_version": MIN_CORE,
         "max_host_version": None,
         "supported_platforms": ["all"],
         "readme_markdown": readme,
     }
-    print("asset:", len(data), "bytes sha256", sha[:16] + "…", "| readme", len(readme), "chars")
+    print(f"要提交：{version['asset_name']} {len(data)}B sha256 {sha[:16]}… ｜ readme {len(readme)} chars ｜ min_host {MIN_CORE}")
 
     st, res = post("/api/v1/plugins", register, token)
     print("register ->", st, json.dumps(brief(res, ["plugin_id", "status", "owner_login", "trust_level"]),

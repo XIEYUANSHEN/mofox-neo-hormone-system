@@ -20,7 +20,7 @@ import urllib.request
 OWNER, REPO = "XIEYUANSHEN", "mofox-neo-hormone-system"
 API = "https://api.github.com"
 MARKET = "https://39.96.71.162"
-MSG = "0.4.6: 打分/整理默认走 utils 不占主回额度；temp 0.2；预算按任务分配；修非法日期标签"
+MSG = "0.4.6: 发版脚本改读 manifest 不再写死版本号；市场 README 成败改看推荐版回读"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UP1 = os.path.dirname(HERE)  # 工作目录布局：UP1 = <ws>；仓库布局：UP1 = <repo>/tools
@@ -34,6 +34,7 @@ else:
 
 # 工作目录里的插件源码在 <ws>/hormone_prod/（仓库里是 hormone_system/）
 PKG = os.path.join(UP1, "hormone_prod") if os.path.isdir(os.path.join(UP1, "hormone_prod")) else os.path.join(DOCS, "hormone_system")
+VER = json.load(open(os.path.join(PKG, "manifest.json"), encoding="utf-8")).get("version", "")
 
 FILES = {
     "README.md": os.path.join(DOCS, "README.md"),
@@ -183,8 +184,13 @@ def main():
             time.sleep(5)
         st, rd = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/readme", token)
         html = (rd or {}).get("html", "") if isinstance(rd, dict) else ""
-        fresh = "不扣 token" in html and "0.4.4.mfp" in html
-        print(f"回读市场页 readme：{len(html)} chars｜" + ("已是新版 ✓" if fresh else "仍是旧版，需要人工看一眼"))
+        # 2026-11-23 实遇：只 PUT readme 回 200 但页面内容不动（渲染跟「推荐版本」附的 readme 走），
+        # 所以判成败要看推荐版本回读，别信 PUT 的状态码。
+        st2, rec = call("GET", f"{MARKET}/api/v1/plugins/hormone_system/recommended-version", token)
+        rec_ver = (rec or {}).get("version") if isinstance(rec, dict) else None
+        fresh = str(VER) in html
+        print(f"回读市场页 readme：{len(html)} chars｜推荐版 {rec_ver}｜"
+              + (f"已含 v{VER} ✓" if fresh else f"页面仍是旧版（PUT 是空操作，得靠发版时带 readme）"))
 
 
 if __name__ == "__main__":
